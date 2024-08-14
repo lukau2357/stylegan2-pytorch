@@ -1,0 +1,6 @@
+venv/*
+*.csv
+*zip
+*.txt
+img*
+__pycache__/**
