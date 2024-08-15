@@ -1,68 +1,115 @@
 import torch
+import torch.nn.functional as F
+
 from typing import Union
-from utils import generate_noise, generate_style_mixes
 
-def wgan_loss(disc_fake : torch.Tensor, disc_real : torch.Tensor):
+class VanillaDiscriminatorLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, real_pred : torch.Tensor, fake_pred : torch.Tensor) -> torch.Tensor:
+        return F.binary_cross_entropy_with_logits(real_pred, torch.ones_like(real_pred)) + F.binary_cross_entropy_with_logits(fake_pred, torch.zeros_like(fake_pred))
+
+class VanillaGeneratorLossNS(torch.nn.Module):
     """
-    disc_fake: (batch_size, 1)
-    disc_real: (batch_size, 1)
-
-    Return sample WGAN-1 loss. When computed for critic, generator parameters should be detached from computational graph. By analogy, when computed for 
-    generator, critic parameters should be detached from the computational graph.
+    Implements non-saturating vanilla GAN Generator loss
     """
-    return disc_fake.mean() - disc_real.mean()
-
-def gradient_penalty(samples_pred : Union[torch.Tensor, None], samples : torch.Tensor, penalty_const : float = 10, fake_samples : Union[torch.Tensor, None] = None, critic = None):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, fake_pred : torch.Tensor) -> torch.Tensor:
+        return F.binary_cross_entropy_with_logits(fake_pred, torch.ones_like(fake_pred)).mean()
+    
+class WGANDiscriminatorLoss(torch.nn.Module):
     """
-    Penalizes critic gradient deviations from 1, tries to enforce 1-Lipschitz constraint on the critic, as discussed in https://arxiv.org/pdf/1704.00028.
-    Additionaly, previously mentioned paper that introduced gradient penalties computes gradients on samples that are obtained by linear interpolation
-    between real and fake samples, but StyleGAN2 seems to compute this on real images only (https://github.com/rosinality/stylegan2-pytorch/blob/master/train.py#L71C5-L71C14).
-
-    We implement gradient penalty so that it supports both regimes.
+    Implements WGAN Discriminator loss, i.e. approximation to Wasserstein-1 distance between real and fake data distributions.
     """
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, real_pred : torch.Tensor, fake_pred : torch.Tensor) -> torch.Tensor:
+        return (fake_pred - real_pred).mean()
 
-    # Perform interpolation between real and fake samples, as discussed in WGAN-GP paper
-    if fake_samples is not None:
-        assert samples.shape == fake_samples.shape
-        eps = torch.rand((fake_samples.shape[0], 1, 1, 1), device = fake_samples.get_device())
-        samples = eps * samples + (1 - eps) * fake_samples
-        samples_pred = critic(samples)
+class WGANGeneratorLoss(torch.nn.Module):
+    def __init__(self):
+        """
+        Implements WGAN Generator loss, i.e. minimizing Wasserstein-1 distance between real and fake data distributions.
+        """
+        super().__init__()
+    
+    def forward(self, fake_pred : torch.Tensor) -> torch.Tensor:
+        return (-fake_pred).mean()
 
-    # retain_graph should be true since we compute second order derivatives in backward pass.
-    # When using MiniBatchSTD, prediction for every sample is affected by other samples as well, creating additional paths in computational graph.
-    grad, = torch.autograd.grad(inputs = samples, outputs = samples_pred.sum(), create_graph = True) 
-    # grad takes the same shape as images, it contains partial derivatives of images_pred with respect to elements of images
-    norm = torch.sqrt(torch.sum(grad ** 2, dim = (1, 2, 3)))
-    return penalty_const * ((norm - 1) ** 2).mean()
+class GradientPenalty(torch.nn.Module):
+    def __init__(self, reg_weight : float = 10.0, gp_type : str = "r1"):
+        """
+        WGAN gradient penalty penalizes critic/discriminator gradient deviations from 1, tries to enforce 1-Lipschitz constraint on the critic, as discussed in https://arxiv.org/pdf/1704.00028.
+        On the other hand, R1 penalty penalizes expected norm of discriminator gradient on the distribution of real samples: https://arxiv.org/pdf/1801.04406v4
+        We implement gradient penalty so that it supports both regimes.
+        """
+        assert gp_type in ["wgan-gp", "r1"]
+        super().__init__()
+        self.reg_weight = reg_weight
+        self.gp_type = gp_type
+
+    def forward(self, real : torch.Tensor, real_pred : Union[torch.Tensor, None] = None, fake_samples : Union[torch.Tensor, None] = None, critic = None) -> torch.Tensor:
+        if self.gp_type == "wgan-gp":
+            eps = torch.rand((fake_samples.shape[0], 1, 1, 1), device = fake_samples.get_device())
+            real = eps * real + (1 - eps) * fake_samples
+            real_pred = critic(real)
+        
+        grad, = torch.autograd.grad(inputs = real, outputs = real_pred.sum(), create_graph = True)
+        norm = torch.sqrt(torch.sum(grad ** 2, dim = (1, 2, 3)))
+
+        if self.gp_type == "wgan-gp":
+            return self.reg_weight * ((norm - 1) ** 2).mean()
+
+        return (self.reg_weight / 2) * (norm ** 2).mean()
 
 class PathLengthPenalty(torch.nn.Module):
-    def __init__(self, beta = 0.99):
+    def __init__(self, reg_weight = 2.0, beta = 0.99):
         super().__init__()
+        self.reg_weight = reg_weight
         self.beta = beta
         self.steps = 0
-        self.a = 0.0
     
     def forward(self, w : torch.Tensor, x : torch.Tensor):
         """
-        w: (batch_size, latent_dim). It needs to be expanded before being passed to the generator because of generalized style mixing forward pass.
-        Should be covered by latest changes in the generator.
-
+        w: (2 * logw(image_size) - 2, batch_size, latent_dim). 
         x: (batch_size, channels, h, w) - Images generated by generator through w
         """
         rh, rw = x.shape[2], x.shape[3]
         device = x.device
+
+        # Path length deviation parameter, kept as a EMA, as discussed in the paper. If not initialized, set to 0
+        if not hasattr(self, "a"):
+            self.a = torch.zeros([], device = device, requires_grad = False)
+
         """
         Following is not mentioned in the paper but is present in StyleGAN2-ADA implementation.
         StyleGAN2 TensorFlow implementation: https://github.com/NVlabs/stylegan2/blob/master/training/loss.py#L167
         StyleGAN2-ADA implementation: https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/loss.py#L81C17-L81C26
-
-        If x is zero mean unit variance per channel, then this ensures unit variance per channel after computing the dot product.
         """
 
-        y = torch.randn(x.shape, device = device) / ((rh * rw) ** 0.5)
-        print((x * y).std(dim = (-1, -2)))
-        out = (x * y).sum()
-        grad, = torch.autograd.grad(inputs = w, outputs = out, create_graph = True)
-        print(grad.shape)
-        gnorm = torch.norm(grad, dim = -1)
-        return ((gnorm - self.a) ** 2).mean()
+        y = torch.randn(x.shape, device = device) / (rh * rw) ** 0.5
+        out = (x * y).sum() # Sum of <x_i, y_i> where x_i is an image obtained with w_i, and y_i are IID Gaussians with 0 mean and 1 / (rh * rw) variance
+        grad, = torch.autograd.grad(inputs = w, outputs = out, create_graph = True) # (2 * logw(image_size) - 2, batch_size, latent_dim)
+        gnorm = torch.sum(grad ** 2, dim = -1).mean(dim = 0).sqrt() # (batch_size)
+
+        """
+        Quote from StyleGAN2 paper: 'To ensure that our regular-izer interacts correctly with style mixing regularization, wecompute it as an average of 
+        all individual layers of the syn-thesis network'. Dimensions for w in this implementation are (2 * logw(image_size) - 2, batch_size, latent_dim), while in 
+        official StyleGAN-2 ADA implementation it looks like the ordering is (2 * logw(image_size) - 2, batch_size, latent_dim)
+
+        In the paper, they mention that regularization weight is computed as ln2 / (target_res ** 2(ln(target_res) - ln2)). However,
+        in official Tensorflow implemntation of StyleGAN2 (https://github.com/NVlabs/stylegan2/blob/master/training/loss.py#L185), 
+        they elaborate that settings regularization weight to 2, dividing noise by (rh * rw) ** 0.5 and taking mean(dim = 0) has the following effect on regularization weight:
+
+        reg_weight = 2 / (target_res ** 2) / (2 * log(target_res) - 2), and this equates to original regularization weight proposed in the paper.
+        """
+
+        a = torch.lerp(self.a, gnorm.mean(), self.beta)
+        self.a.copy_(a.detach())
+        res = self.reg_weight * ((gnorm - a) ** 2).mean() # Monte-Carlo estimate of Equation (4) from StyleGAN2 paper.
+        self.steps += 1
+        return res

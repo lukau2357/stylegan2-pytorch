@@ -1,35 +1,61 @@
 import os
 import math
-import cv2
 import tqdm
+import torch
+import torchvision
+import cv2
+import torch
+import numpy as np
 
-def preprocess(img_size):
+from PIL import Image
+from typing import Union
+
+def preprocess(img_size, source_dir : str, target_dir : str, center_crop_size : Union[float, None] = None, alpha : float = 1):
     """
     CelebA (at least the original form) contains images of size 218x178. 218 = 2 x 89, 178 = 2 x 109, since layers inside
-    generator and critic should double/shrink resolutions by factor of 2, this is inconvenient. Hence, we resize all images of CelebA to 128 x 128.
-    We perform dimension shrinking using pixel area relation.
+    generator and critic should double/shrink resolutions by factor of 2, this is inconvenient. Hence, we resize all images of CelebA to a 
+    desired power of 2. In addition, center cropping can be performed.
+
+    alpha - Controls the portion of the dataset to preprocess, was useful for testing.
     """
-    x = math.log2(img_size)
-    assert x == int(x), f"Given image size {img_size} must be a power of 2"
-    source_dir = os.path.join("img_align_celeba", "img_align_celeba")
-    target_dir = f"img_alig_celeba_{img_size}"
+
+    x = int(math.log2(img_size))
+    assert math.log2(img_size) == x, f"{img_size} is not a power of 2"
 
     if not os.path.exists(target_dir):
         os.mkdir(target_dir)
 
-    print(f"Resizing CelebA images to {img_size}:")
+    clist = [torchvision.transforms.CenterCrop(center_crop_size)] if center_crop_size is not None else []
+    compose = torchvision.transforms.Compose(clist + [torchvision.transforms.Resize((img_size, img_size))])
 
-    for label in tqdm.tqdm(os.listdir(source_dir)):
-        img = cv2.imread(os.path.join(source_dir, label))
+    labels = os.listdir(source_dir)
+    labels = labels[:int(len(labels) * alpha)]
 
-        if max(img.shape) <= img_size:
-            img = cv2.resize(img, (img_size, img_size), interpolation = cv2.INTER_CUBIC)
-        
-        else:
-            img = cv2.resize(img, (img_size, img_size), interpolation = cv2.INTER_AREA)
+    print(f"Transforming CelebA images to {img_size}:")
 
-        cv2.imwrite(os.path.join(target_dir, label), img)
+    for label in tqdm.tqdm(labels):
+        image = Image.open(os.path.join(source_dir, label))
+        image = compose(image)
+        image.save(os.path.join(target_dir, label))
 
+class Dataset(torch.utils.data.Dataset):
+    def __init__(self, path : str, alpha : float = 1):
+        """
+        Constructor for custom RGB image Dataset class. 
+        path - Name of the directory that contains images, preferably resized to a power of 2. Path should be given relative to cwd.
+        alpha - Ratio of original dataset to consider. Was useful for testing
+        """
+        self.path = path
+        self.alpha = alpha
+        self.imgs = [os.path.join(path, item) for item in os.listdir(self.path)]
+    
+    def __len__(self):
+        return len(self.imgs)
+
+    def __getitem__(self, idx) -> torch.Tensor:
+        return torch.tensor(np.asarray(Image.open(self.imgs[idx])).transpose((2, 1, 0)).astype(np.float32))
 
 if __name__ == "__main__":
-    preprocess(256)
+    # preprocess(128, os.path.join("img_align_celeba", "img_align_celeba"), "celeba_128_v2", alpha = 0.01)
+    d = Dataset("celeba_128_v2")
+    img = d[0]

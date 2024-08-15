@@ -4,8 +4,8 @@ import math
 import torchvision
 
 from typing import Tuple, List, Union
-from losses import gradient_penalty, PathLengthPenalty
 from utils import generate_noise, generate_style_mixes
+from PIL import Image
 
 def leaky_relu(p : float = 0.2):
     return torch.nn.LeakyReLU(negative_slope = p)
@@ -206,7 +206,7 @@ class ToRgb(torch.nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        self.affine = EqualizedLinear(latent_dim, in_channels)
+        self.affine = EqualizedLinear(latent_dim, in_channels, bias = 1.)
         self.conv = Conv2dModulation(in_channels, out_channels, 1, demodulate = False)
         self.bias = torch.nn.Parameter(torch.zeros(out_channels))
 
@@ -226,51 +226,57 @@ class GeneratorBlock(torch.nn.Module):
         self.gen_block_2 = StyleBlock(out_channels, out_channels, latent_dim)
         self.trgb = ToRgb(latent_dim, out_channels)
     
-    def forward(self, X: torch.Tensor, w: torch.Tensor, noise : Tuple[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        X = self.gen_block_1(X, w, noise[0])
-        X = self.gen_block_2(X, w, noise[1])
-        return X, self.trgb(X, w)
+    def forward(self, X: torch.Tensor, w : torch.Tensor, noise : Tuple[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        X = self.gen_block_1(X, w[0], noise[0])
+        X = self.gen_block_2(X, w[1], noise[1])
+        return X, self.trgb(X, w[2])
 
 class Smooth(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, fir_filter : List[int] = [1, 3, 3, 1]):
         super().__init__()
-        # Based on: https://github.com/lucidrains/stylegan2-pytorch/blob/master/stylegan2_pytorch/stylegan2_pytorch.py#L27 smoothing filter is [1, 2, 1]
-        # Official StyleGan2-ADA uses [1, 3, 3, 1] (https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/networks.py#L132C73-L132C84)
-        # Also, there is reference [64] in StyleGan paper that references usage of this kernel
-        # Can't seem to get it working with [1, 3, 3, 1] though, asymmetric padding
-        filter = torch.tensor([[1, 2, 1]])
+        filter = torch.tensor([fir_filter])
         filter = filter.T.matmul(filter).detach().float()[None, None, :, :]
         filter /= filter.sum()
         # Normalize the filter
         self.register_buffer("filter", filter)
-        self.pad = torch.nn.ReplicationPad2d((1)) # https://pytorch.org/docs/stable/generated/torch.nn.ReplicationPad2d.html
-        
+
+        # Motivated by: https://github.com/NVlabs/stylegan2-ada-pytorch/blob/d72cc7d041b42ec8e806021a205ed9349f87c6a4/torch_utils/ops/upfirdn2d.py#L272
+        self.w = filter.shape[-1]
+        self.h = filter.shape[-2]
+        self.pad_xleft = (self.w - 1) // 2
+        self.pad_xright = (self.w) // 2
+        self.pad_ytop = (self.h - 1) // 2
+        self.pad_ybot = (self.h) // 2
+        self.pad = (self.pad_xleft, self.pad_xright, self.pad_ytop, self.pad_ybot)
+
     def forward(self, X : torch.Tensor):
         b, c, h, w = X.shape
         X = X.reshape(-1, 1, h, w) 
-        X = torch.nn.functional.conv2d(self.pad(X), self.filter)
+        X = torch.nn.functional.conv2d(torch.nn.functional.pad(X, self.pad), self.filter)
         return X.reshape(b, c, h, w)
 
 class Upsample(torch.nn.Module):
-    def __init__(self, sf = 2):
+    def __init__(self, sf : int = 2, fir_filter : List[int] = [1, 3, 3, 1]):
         super().__init__()
+        self.sf = sf
         self.upsample = torch.nn.Upsample(scale_factor = sf, mode = "bilinear", align_corners = False)
-        self.smooth = Smooth()
-    
+        self.smooth = Smooth(fir_filter = fir_filter)
+
     def forward(self, X : torch.Tensor):
-        return self.smooth(self.upsample(X))
+        return self.smooth((self.upsample(X)))
 
 class Downsample(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, sf : int = 2, fir_filter : List[int] = [1, 3, 3, 1]):
         super().__init__()
-        self.downsample = torch.nn.Upsample(scale_factor = 0.5, mode = "bilinear", align_corners = False)
-        self.smooth = Smooth()
-    
+        self.sf = sf
+        self.downsample = torch.nn.Upsample(scale_factor = 1 / self.sf, mode = "bilinear", align_corners = False)
+        self.smooth = Smooth(fir_filter = fir_filter)
+
     def forward(self, X : torch.Tensor):
         return self.downsample(self.smooth(X))
 
 class Generator(torch.nn.Module):
-    def __init__(self, image_size : int, latent_dim : int, network_capacity : int = 8, max_features : int = 512):
+    def __init__(self, image_size : int, latent_dim : int, network_capacity : int = 8, max_features : int = 512, fir_filter : List[int] = [1, 3, 3, 1], use_tanh_last : bool = True):
         super().__init__()
         self.image_size = image_size
         self.latent_dim = latent_dim
@@ -279,33 +285,53 @@ class Generator(torch.nn.Module):
         # Channel shrinking strategy per resolution taken from https://github.com/lucidrains/stylegan2-pytorch/blob/master/stylegan2_pytorch/stylegan2_pytorch.py
         # StyleGan papers are too ambiguous in this regard. With network_capacity = 8 and image_size = 1024, obtained number of filters per resolution
         # is consistent with ProGAN paper, Table 2 in the paper. (https://arxiv.org/pdf/1710.10196)
-        self.num_layers = int(math.log2(image_size) - 1) # -1 because first 4x4 resolution layer is not considered as a full generator block
+        self.num_layers = int(math.log2(image_size) - 1)
         self.filters = [min(max_features, network_capacity * (2 ** (i + 1))) for i in range(self.num_layers)][::-1]
         self.start_tensor = torch.nn.Parameter(torch.randn(1, self.filters[0], 4, 4))
         self.style_start = StyleBlock(self.filters[0], self.filters[0], latent_dim)
         self.to_rgb_start = ToRgb(latent_dim, self.filters[0])
+        self.use_tanh_last = use_tanh_last
         self.blocks = torch.nn.ModuleList([GeneratorBlock(self.filters[i - 1], self.filters[i], latent_dim) for i in range(1, len(self.filters))])
-        self.upsample = Upsample()
+        self.upsample = Upsample(fir_filter = fir_filter)
 
     def forward(self, w : torch.Tensor, noise : List[Tuple[torch.Tensor]]):
         """
-        w: (self.num_layers + 1, batch_size, latent_dim) - For each sample, style vector to be used at layer i. Elegantlly encompasses style mixing regularization
-        """
-        w = w[None, :].expand(self.num_layers + 1, -1 , -1) if len(w.shape) == 2 else w
+        w: (2 * (log2(image_size) - 1), batch_size, latent_dim) - First dimension determines which style vector is taken for which affine map. This encompasses 
+        style mixing regularization as well as passing a single style vector to all affine maps in the generator.
 
+        noise: List of tuples of noises to add to generated images of differing resolutions throughout the network. First element of the list is a tuple 
+        of a single element, others are 2-tuples (since first layer consists of only one convlution). If we observe noise[i], tensors in tuples are 
+        of shape (batch_size, 1, 2 ** (i + 2), 2 ** (i + 2)), random IID Gaussian noise. generate_noise function in utils.py generates this list. 
+
+        For StyleGAN2-ADA official implementation, it seems that toRGB of i-th layer and first convolution on layer i + 1 always share the same style vector.
+        This can be inferred from the following:
+        https://github.com/NVlabs/stylegan2-ada-pytorch/blob/d72cc7d041b42ec8e806021a205ed9349f87c6a4/training/networks.py#L463
+        https://github.com/NVlabs/stylegan2-ada-pytorch/blob/d72cc7d041b42ec8e806021a205ed9349f87c6a4/training/networks.py#L361
+
+        Also an issue related to this was posted in the same repository:
+        https://github.com/NVlabs/stylegan2-ada-pytorch/issues/50
+
+        It seems that this was intentional, because in StyleGAN2 official Tensorflow implementation, there is a calculation regarding the weight of
+        path length regularization, and they set the number of affine layers in the network to 2 * log_2(image_size) - 2 there, which is consistent with
+        previous observations. A lot of online StyleGAN2 implementations implement style mixing only to the level of GeneratorBlock objects, this implementation
+        follows the original implementation as closely as possible.
+
+        Return: (batch_size, 3, img_size, img_size), generated samples.
+        """
         _, b, _ = w.shape
         # Repeath starting tensor for each sample in the batch
         X = self.style_start(self.start_tensor.expand(b, -1, -1, -1), w[0], noise[0][0])
-        rgb = self.to_rgb_start(X, w[0])
-    
+        rgb = self.to_rgb_start(X, w[1])
+        w_ind = 1
+
         for i in range(1, len(noise)):
-            X_new, rgb_new = self.blocks[i - 1].forward(self.upsample(X), w[i], (noise[i][0], noise[i][1]))
+            X_new, rgb_new = self.blocks[i - 1].forward(self.upsample(X), w[w_ind : w_ind + 3], (noise[i][0], noise[i][1]))
             rgb = rgb_new + self.upsample(rgb)
             X = X_new
+            w_ind += 2
         
-        # Original StyleGan2 paper does not include nonlinearities when computing RGBs accross different resolutions. Therefore, output image pixels are not constrainted
-        # to any range, although this can easily be done through min/max normalization per-channels. We will leave it as is, for now
-        return rgb
+        # In constrast to StyleGAN2 paper, we allow for using tanh at the very last layer to obtain output in range [-1, 1]
+        return torch.nn.functional.tanh(rgb) if self.use_tanh_last else rgb
     
 class DiscriminatorBlock(torch.nn.Module):
     """
@@ -322,7 +348,7 @@ class DiscriminatorBlock(torch.nn.Module):
         https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/networks.py#L552
         https://github.com/NVlabs/stylegan2/blob/master/training/networks_stylegan2.py#L653
     """
-    def __init__(self, in_channels : int, out_channels : int):
+    def __init__(self, in_channels : int, out_channels : int, fir_filter : List[int] = [1, 3, 3, 1]):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -330,8 +356,8 @@ class DiscriminatorBlock(torch.nn.Module):
         self.conv1 = EqualizedConv2d(in_channels, in_channels, 3, gain = get_leaky_relu_gain())
         self.conv2 = EqualizedConv2d(in_channels, out_channels, 3, stride = 2, padding = 1, gain = get_leaky_relu_gain())
         self.activation = leaky_relu()
-        self.smooth = Smooth()
-        self.ds = Downsample()
+        self.smooth = Smooth(fir_filter = fir_filter)
+        self.ds = Downsample(fir_filter = fir_filter)
 
     def forward(self, X : torch.Tensor):
         """
@@ -421,7 +447,8 @@ class Discriminator(torch.nn.Module):
                  max_features : int = 512, 
                  use_mbstd : bool = True, 
                  mbstd_group_size : int = 4, 
-                 mbstd_num_channels : int = 1):
+                 mbstd_num_channels : int = 1,
+                 fir_filter : List[int] = [1, 3, 3, 1]):
         super().__init__()
         self.input_res = input_res
         self.in_channels = in_channels
@@ -441,7 +468,7 @@ class Discriminator(torch.nn.Module):
         # For now, working with RGB images only - 3 input chanels that is.
         self.from_rgb = torch.nn.Sequential(EqualizedConv2d(3, self.filters[0], 1, gain = get_leaky_relu_gain()), self.lrelu)
         self.disc_blocks = torch.nn.Sequential(*[
-            DiscriminatorBlock(self.filters[i], self.filters[i + 1]) for i in range(len(self.filters) - 1)
+            DiscriminatorBlock(self.filters[i], self.filters[i + 1], fir_filter = fir_filter) for i in range(len(self.filters) - 1)
         ])
 
         # TODO: Last resolution hardcoded to 4, perhaps make it dynamic somehow?
@@ -466,7 +493,9 @@ class StyleGAN2(torch.nn.Module):
                  gen_ema_coeff : float = 0.999,
                  use_mbstd : bool = True, 
                  mbstd_group_size : int = 4, 
-                 mbstd_num_channels : int = 1):
+                 mbstd_num_channels : int = 1,
+                 fir_filter : List[int] = [1, 3, 3, 1],
+                 use_tanh_last : bool = True):
         super().__init__()
         self.latent_dim = latent_dim
         self.target_resolution = target_resolution
@@ -480,10 +509,10 @@ class StyleGAN2(torch.nn.Module):
         self.mbstd_num_channels = mbstd_num_channels
 
         self.MN = MappingNetwork(latent_dim, mlp_depth, lr_mul = mlp_lr_multiplier)
-        self.G = Generator(target_resolution, latent_dim, network_capacity = network_capacity, max_features = max_features)
-        self.D = Discriminator(target_resolution, 3, network_capacity = network_capacity, max_features = max_features, use_mbstd = use_mbstd, mbstd_group_size = mbstd_group_size, mbstd_num_channels = mbstd_num_channels)
+        self.G = Generator(target_resolution, latent_dim, network_capacity = network_capacity, max_features = max_features, fir_filter = fir_filter, use_tanh_last = use_tanh_last)
+        self.D = Discriminator(target_resolution, 3, network_capacity = network_capacity, max_features = max_features, use_mbstd = use_mbstd, mbstd_group_size = mbstd_group_size, mbstd_num_channels = mbstd_num_channels, fir_filter = fir_filter)
 
-        self.GE = Generator(target_resolution, latent_dim, network_capacity = network_capacity, max_features = max_features)
+        self.GE = Generator(target_resolution, latent_dim, network_capacity = network_capacity, max_features = max_features, fir_filter = fir_filter, use_tanh_last = use_tanh_last)
         self.MNE = MappingNetwork(latent_dim, mlp_depth, lr_mul = mlp_lr_multiplier)
 
     def EMA(self):
@@ -524,14 +553,18 @@ class StyleGAN2(torch.nn.Module):
 
 if __name__ == "__main__":
     DEVICE = "cuda"
-    stylegan = StyleGAN2(512, 128).to(DEVICE)
+    stylegan = StyleGAN2(512, 128, fir_filter = [1, 3, 3, 1], use_tanh_last = False).to(DEVICE)
     bs = 32
     generator = stylegan.G
 
-    z = torch.randn((32, 512)).to(DEVICE)
-    w = stylegan.MN(z)
-    noise = generate_noise(128, 32, DEVICE)
+    w = generate_style_mixes(stylegan.MN, 128, bs, DEVICE, style_mixing_prob = 0.9)
+    noise = generate_noise(128, bs, DEVICE)
+
     X_fake = stylegan.G.forward(w, noise)
-    torch.autograd.set_detect_anomaly(True)
-    plp = PathLengthPenalty()
-    plp.forward(w, X_fake)
+    X_fake = ((X_fake * 127.5 + 128).clamp(0, 255)).to(torch.uint8)
+    img = torchvision.utils.make_grid(X_fake, nrow = 8)
+    img = torchvision.transforms.functional.to_pil_image(img)
+    img.show()
+    exit(0)
+    img = Image.fromarray(X_fake[0].cpu().numpy(), "RGB")
+    img.show()

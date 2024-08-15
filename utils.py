@@ -2,9 +2,11 @@ import torch
 import math
 from typing import List, Union, Tuple
 
-def generate_style_mixes(mapping_network, generator_layers : int, batch_size : int, device : str, style_mixing_prob : float = 0.9) -> torch.Tensor:
+def generate_style_mixes(mapping_network, target_resolution : int, batch_size : int, device : str, style_mixing_prob : float = 0.9) -> torch.Tensor:
     w_sm = []
     i = 0
+
+    l = int(2 * (math.log2(target_resolution) - 1))
 
     while i < batch_size:
         x = torch.rand(()).item()
@@ -12,16 +14,16 @@ def generate_style_mixes(mapping_network, generator_layers : int, batch_size : i
             z = torch.randn((2, mapping_network.latent_dim)).to(device)
             w = mapping_network(z)
             """
-            w1 is to be used in range [0, crossover_point], w2 is to be used in range [crossover_point + 1, generator_layers].
+            w1 is to be used in range [0, crossover_point], w2 is to be used in range [crossover_point + 1, l - 1].
             Taking randint(0, generator_layers) ensures that at least one part of both vectors will be used in generated style mixing.
             """
-            crossover_point = torch.randint(0, generator_layers, (1,)).item() 
-            w = torch.cat((w[0:1].expand(crossover_point + 1, -1), w[1:2].expand(generator_layers - crossover_point, -1)), dim = 0)
+            crossover_point = torch.randint(0, l - 1, (1,)).item() 
+            w = torch.cat((w[0:1].expand(crossover_point + 1, -1), w[1:2].expand(l - crossover_point - 1, -1)), dim = 0)
             w_sm.append(w)
 
         else:
             z = torch.randn((1, mapping_network.latent_dim)).to(device)
-            w = mapping_network(z)[0:1].expand(generator_layers + 1, -1)
+            w = mapping_network(z).expand(l, -1)
             w_sm.append(w)
 
         i += 1
