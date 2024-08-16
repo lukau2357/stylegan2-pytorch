@@ -108,7 +108,9 @@ class PathLengthPenalty(torch.nn.Module):
         reg_weight = 2 / (target_res ** 2) / (2 * log(target_res) - 2), and this equates to original regularization weight proposed in the paper.
         """
 
-        a = torch.lerp(self.a, gnorm.mean(), self.beta)
+        # Inverse of https://github.com/NVlabs/stylegan2-ada-pytorch/blob/d72cc7d041b42ec8e806021a205ed9349f87c6a4/training/loss.py#L85C69-L85C77
+        # because of different beta parameterization.
+        a = torch.lerp(gnorm.mean(), self.a, self.beta) # https://pytorch.org/docs/stable/generated/torch.lerp.html
         self.a.copy_(a.detach())
         res = self.reg_weight * ((gnorm - a) ** 2).mean() # Monte-Carlo estimate of Equation (4) from StyleGAN2 paper.
         self.steps += 1

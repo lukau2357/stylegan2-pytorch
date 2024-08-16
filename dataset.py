@@ -3,12 +3,12 @@ import math
 import tqdm
 import torch
 import torchvision
-import cv2
 import torch
 import numpy as np
 
 from PIL import Image
 from typing import Union
+from functools import partial
 
 def preprocess(img_size, source_dir : str, target_dir : str, center_crop_size : Union[float, None] = None, alpha : float = 1):
     """
@@ -48,14 +48,24 @@ class Dataset(torch.utils.data.Dataset):
         self.path = path
         self.alpha = alpha
         self.imgs = [os.path.join(path, item) for item in os.listdir(self.path)]
+        self.imgs = self.imgs[:int(len(self.imgs) * alpha)]
     
     def __len__(self):
         return len(self.imgs)
 
     def __getitem__(self, idx) -> torch.Tensor:
-        return torch.tensor(np.asarray(Image.open(self.imgs[idx])).transpose((2, 1, 0)).astype(np.float32))
+        return torch.tensor(np.asarray(Image.open(self.imgs[idx])).transpose((2, 0, 1)).astype(np.float32))
+
+def get_data_loader(dataset : Dataset, batch_size : int, pin_memory : bool = True, num_workers : int = 0):
+    return torch.utils.data.DataLoader(dataset, 
+                                       batch_size = batch_size, 
+                                       shuffle = True, 
+                                       pin_memory = pin_memory, 
+                                       num_workers = num_workers, 
+                                       collate_fn = lambda x: torch.stack(x, dim = 0) / 127.5 - 1) # Transform to range [-1, 1]
 
 if __name__ == "__main__":
     # preprocess(128, os.path.join("img_align_celeba", "img_align_celeba"), "celeba_128_v2", alpha = 0.01)
     d = Dataset("celeba_128_v2")
-    img = d[0]
+    dl = get_data_loader(d, 32)
+    print(next(iter(dl)).to("cuda"))

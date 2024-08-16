@@ -1,6 +1,7 @@
 venv/*
 *.csv
 *zip
-*.txt
+todo.txt
 img*
 __pycache__/**
+celeba_128_v2/

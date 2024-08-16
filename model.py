@@ -33,7 +33,7 @@ class EqualizedWeight(torch.nn.Module):
         self.lr_mul = lr_mul
         self.weight = torch.nn.Parameter(torch.randn(shape) / lr_mul) # Dividing by lr_mul here and multiplying in the forward pass ensures that X has standard deviation c.
 
-    def forward(self):
+    def forward(self) -> torch.Tensor:
         """
         Performs self-scaling of weights with Kaiming constant.
         """
@@ -49,7 +49,7 @@ class EqualizedLinear(torch.nn.Module):
         self.b = torch.nn.Parameter(torch.ones(out_features) * bias)
         self.lr_mul = lr_mul
 
-    def forward(self, X : torch.Tensor):
+    def forward(self, X : torch.Tensor) -> torch.Tensor:
         """
         X: (batch_size, in_features, out_features). self.w() is called to enforce for reasons discussed above. 
 
@@ -77,9 +77,9 @@ class EqualizedConv2d(torch.nn.Module):
             self.b = torch.nn.Parameter(torch.ones(out_channels) * bias)
 
         else:
-            self.register_buffer("b", torch.zeros(out_channels))
+            self.b = torch.nn.Parameter(torch.zeros(out_channels), requires_grad = False)
 
-    def forward(self, X : torch.Tensor):
+    def forward(self, X : torch.Tensor) -> torch.Tensor:
         """
         X: (batch_size, in_channels, h, w)
 
@@ -97,11 +97,13 @@ class MappingNetwork(torch.nn.Module):
     factor of decay. Keep in mind that this is not exactly equivalent to explicitly modyfing the learning rate within the optimizer for desired parameters, but it gets
     the job done apparently.
     """
-    def __init__(self, latent_dim : int, depth : int, lr_mul : float = 0.01):
+    def __init__(self, latent_dim : int, depth : int, lr_mul : float = 0.01, w_ema_beta : float = 0.995):
         super().__init__()
         self.latent_dim = latent_dim
         self.depth = depth
         self.lr_mul = lr_mul
+        self.w_ema_beta = w_ema_beta
+        self.w_ema = torch.nn.Parameter(torch.zeros((latent_dim)), requires_grad = False)
         layers = []
 
         for _ in range(depth):
@@ -109,14 +111,23 @@ class MappingNetwork(torch.nn.Module):
 
         self.net = torch.nn.Sequential(*layers)
 
-    def forward(self, z : torch.Tensor) -> torch.Tensor:
+    def forward(self, z : torch.Tensor, truncation_psi : float = 1, update_w_ema : bool = False) -> torch.Tensor:
         """
         z: (batch_size, latent_dim). 
         Return:
             w: (batch_size, latent_dim)
         """
         z = torch.nn.functional.normalize(z, dim = 1)
-        return self.net(z)
+        w = self.net(z)
+
+        if update_w_ema:
+            # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/d72cc7d041b42ec8e806021a205ed9349f87c6a4/training/networks.py#L234
+            self.w_ema.copy_(w.detach().mean(dim = 0).lerp(self.w_ema, self.w_ema_beta))
+
+        if truncation_psi < 1:
+            return (1 - truncation_psi) * self.w_ema + truncation_psi * w
+        
+        return w
 
 class Conv2dModulation(torch.nn.Module):
     """
@@ -181,7 +192,7 @@ class StyleBlock(torch.nn.Module):
         self.conv = Conv2dModulation(in_channels, out_channels, 3, gain = get_leaky_relu_gain())
         self.activation = leaky_relu()
 
-    def forward(self, X : torch.Tensor, w : torch.Tensor, noise : torch.Tensor):
+    def forward(self, X : torch.Tensor, w : torch.Tensor, noise : torch.Tensor) -> torch.Tensor:
         """
         X: (batch_size, in_channels, h, w) - Feature maps from previous layer
         w: (batch_size, latent_dim) - Style vector w for each sample that is used to generate style scales
@@ -210,7 +221,7 @@ class ToRgb(torch.nn.Module):
         self.conv = Conv2dModulation(in_channels, out_channels, 1, demodulate = False)
         self.bias = torch.nn.Parameter(torch.zeros(out_channels))
 
-    def forward(self, X, w):
+    def forward(self, X, w) -> torch.Tensor:
         style_scales = self.affine(w)
         rgb = self.conv(X, style_scales)
         return rgb + self.bias[None, :, None, None]
@@ -238,7 +249,7 @@ class Smooth(torch.nn.Module):
         filter = filter.T.matmul(filter).detach().float()[None, None, :, :]
         filter /= filter.sum()
         # Normalize the filter
-        self.register_buffer("filter", filter)
+        self.filter = torch.nn.Parameter(filter, requires_grad = False)
 
         # Motivated by: https://github.com/NVlabs/stylegan2-ada-pytorch/blob/d72cc7d041b42ec8e806021a205ed9349f87c6a4/torch_utils/ops/upfirdn2d.py#L272
         self.w = filter.shape[-1]
@@ -294,7 +305,7 @@ class Generator(torch.nn.Module):
         self.blocks = torch.nn.ModuleList([GeneratorBlock(self.filters[i - 1], self.filters[i], latent_dim) for i in range(1, len(self.filters))])
         self.upsample = Upsample(fir_filter = fir_filter)
 
-    def forward(self, w : torch.Tensor, noise : List[Tuple[torch.Tensor]]):
+    def forward(self, w : torch.Tensor, noise : List[Tuple[torch.Tensor]]) -> torch.Tensor:
         """
         w: (2 * (log2(image_size) - 1), batch_size, latent_dim) - First dimension determines which style vector is taken for which affine map. This encompasses 
         style mixing regularization as well as passing a single style vector to all affine maps in the generator.
@@ -482,6 +493,7 @@ class Discriminator(torch.nn.Module):
         X = self.disc_blocks(X)
         return self.last(X)
 
+# TODO: This class is redundant, should be removed! Keep only number of parameters
 class StyleGAN2(torch.nn.Module):
     def __init__(self, 
                  latent_dim : int, 
@@ -511,35 +523,41 @@ class StyleGAN2(torch.nn.Module):
         self.MN = MappingNetwork(latent_dim, mlp_depth, lr_mul = mlp_lr_multiplier)
         self.G = Generator(target_resolution, latent_dim, network_capacity = network_capacity, max_features = max_features, fir_filter = fir_filter, use_tanh_last = use_tanh_last)
         self.D = Discriminator(target_resolution, 3, network_capacity = network_capacity, max_features = max_features, use_mbstd = use_mbstd, mbstd_group_size = mbstd_group_size, mbstd_num_channels = mbstd_num_channels, fir_filter = fir_filter)
+        # Exponential moving average of generator weights during training, will be ultimately used for final inference.
 
         self.GE = Generator(target_resolution, latent_dim, network_capacity = network_capacity, max_features = max_features, fir_filter = fir_filter, use_tanh_last = use_tanh_last)
         self.MNE = MappingNetwork(latent_dim, mlp_depth, lr_mul = mlp_lr_multiplier)
+
+        # Initialize all exponential moving average parameters to 0
+        for ge_param in self.GE.parameters():
+            ge_param.data = torch.zeros_like(ge_param.data)
+        
+        for mne_param in self.MNE.parameters():
+            mne_param.data = torch.zeros_like(mne_param.data)
 
     def EMA(self):
         """
         Perform exponential moving average update of Generator weights (including the mapping network), using gen_ema_coeff. 
         This was first introduced, to my knowledge at least in ProGAN paper, https://arxiv.org/pdf/1710.10196. Another paper goes into mathematical details
         of why this works: https://arxiv.org/pdf/1806.04498
-        """
 
+        Based on StyleGAN-2 implementation, they use exponential decay based on hyperparameters that can be found in 
+        https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/training_loop.py#L297. However, for default values, this defaults to exponential moving
+        average decay of approximately 0.999, which is the same as in ProGAN paper.
+        """
         for g_param, ge_param in zip(self.G.parameters(), self.GE.parameters()):
             p_new = g_param.data
             p_old = ge_param.data
             ge_param.data = self.gen_ema_coeff * p_old + (1 - self.gen_ema_coeff) * p_new
         
-        for mn_param, mne_param in zip(self.MN.parameters(), self.MNE.parameters()):
-            p_new = mn_param.data
-            p_old = mne_param.data
-            mne_param.data = self.gen_ema_coeff * p_old + (1 - self.gen_ema_coeff) * p_new
-
     def num_parameters(self, verbose : bool = True) -> Tuple[int, int, int]:
         gen_params, mapping_params, disc_params = 0, 0, 0
-        def _count_parameters(model):
+        def __count_parameters(model):
             return sum(p.numel() for p in model.parameters() if p.requires_grad)
         
-        gen_params = _count_parameters(self.G)
-        mapping_params = _count_parameters(self.MN)
-        disc_params = _count_parameters(self.D)
+        gen_params = __count_parameters(self.G)
+        mapping_params = __count_parameters(self.MN)
+        disc_params = __count_parameters(self.D)
 
         if verbose:
             print(f"Number of mapping network parameters: {mapping_params / 1e6:.2f}M")
@@ -548,23 +566,14 @@ class StyleGAN2(torch.nn.Module):
         
         return gen_params, mapping_params, disc_params
 
-    def forward_gen(self, w : torch.Tensor, device : str) -> torch.Tensor:
+    def generate_samples(self, num_samples : int, device : str) -> torch.Tensor:
+        """
+        Generates num_samples from generator, without performing style mixing.
+        """
+        z = torch.randn((num_samples, self.latent_dim), device = device)
+        w = self.MNE(z)
+
         return self.G(w, generate_noise(self.target_resolution, w.shape[1], device))
 
 if __name__ == "__main__":
-    DEVICE = "cuda"
-    stylegan = StyleGAN2(512, 128, fir_filter = [1, 3, 3, 1], use_tanh_last = False).to(DEVICE)
-    bs = 32
-    generator = stylegan.G
-
-    w = generate_style_mixes(stylegan.MN, 128, bs, DEVICE, style_mixing_prob = 0.9)
-    noise = generate_noise(128, bs, DEVICE)
-
-    X_fake = stylegan.G.forward(w, noise)
-    X_fake = ((X_fake * 127.5 + 128).clamp(0, 255)).to(torch.uint8)
-    img = torchvision.utils.make_grid(X_fake, nrow = 8)
-    img = torchvision.transforms.functional.to_pil_image(img)
-    img.show()
-    exit(0)
-    img = Image.fromarray(X_fake[0].cpu().numpy(), "RGB")
-    img.show()
+    sgan1 = StyleGAN2(512, 128, 8)
