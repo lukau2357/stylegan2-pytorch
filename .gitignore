@@ -5,3 +5,4 @@ todo.txt
 img*
 __pycache__/**
 celeba_128_v2/
+celeba_256_v2/

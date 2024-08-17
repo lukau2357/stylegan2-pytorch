@@ -57,15 +57,18 @@ class Dataset(torch.utils.data.Dataset):
         return torch.tensor(np.asarray(Image.open(self.imgs[idx])).transpose((2, 0, 1)).astype(np.float32))
 
 def get_data_loader(dataset : Dataset, batch_size : int, pin_memory : bool = True, num_workers : int = 0):
-    return torch.utils.data.DataLoader(dataset, 
+    dl = torch.utils.data.DataLoader(
+                                       dataset, 
                                        batch_size = batch_size, 
                                        shuffle = True, 
                                        pin_memory = pin_memory, 
                                        num_workers = num_workers, 
-                                       collate_fn = lambda x: torch.stack(x, dim = 0) / 127.5 - 1) # Transform to range [-1, 1]
+                                       collate_fn = lambda x: torch.stack(x, dim = 0) / 127.5 - 1,
+                                       drop_last = True) # Transform to range [-1, 1]
+    
+    while True:
+        for sample in dl:
+            yield sample
 
 if __name__ == "__main__":
-    # preprocess(128, os.path.join("img_align_celeba", "img_align_celeba"), "celeba_128_v2", alpha = 0.01)
-    d = Dataset("celeba_128_v2")
-    dl = get_data_loader(d, 32)
-    print(next(iter(dl)).to("cuda"))
+    preprocess(256, os.path.join("img_align_celeba", "img_align_celeba"), "celeba_256_v2", alpha = 0.01)

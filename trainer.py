@@ -2,20 +2,18 @@ import torch
 import os
 import copy
 import losses
-import time
 import math
+import tqdm
+import numpy as np
 
 from model import Generator, Discriminator, MappingNetwork
 from dataset import Dataset, get_data_loader
-from typing import Union
-from utils import generate_style_mixes, generate_noise
+from typing import Union, Tuple
+from utils import generate_style_mixes, generate_noise, generate_samples
+from torchvision.utils import make_grid
+from PIL import Image
 
-def requires_grad(model : torch.nn.Module, flag : bool):
-    for param in model.parameters():
-        param.requires_grad_(flag)
-
-# For now, supports only single GPU training
-# Also, no gradient accumulation, for now.
+# For now, supports only single GPU training. Also, no gradient accumulation, for now.
 class Trainer:
     def __init__(self,
         MN : Union[MappingNetwork, None],
@@ -26,6 +24,8 @@ class Trainer:
         val_loader : torch.utils.data.DataLoader,
         total_steps : int,              # Number of training steps (for generator?),
         device : str,
+        target_resolution : int,
+        batch_size : int,
         checkpoint_path : Union[str, None] = None,    # Checkpoint directory for the model inside root_path. If present, will load and overwrite given model if it is not None,
         load_latest : Union[bool, None] = None,
         load_best_fid_val : Union[bool, None] = None,
@@ -44,14 +44,18 @@ class Trainer:
         adam_beta2 : float = 0.99,
         adam_eps : float = 1e-8,
         save_every : int = 1000,
-        gen_ema_beta : float = 0.999
+        gen_ema_beta : float = 0.999,
+        grad_accum_steps : int = 1,
+        compute_generator_ema : bool = True
     ):
         self.root_path = root_path
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.total_steps = total_steps
         self.device = device
-
+        self.target_resolution = target_resolution
+        self.batch_size = batch_size
+        
         assert loss_type in ["vanilla", "wgan"]
         self.loss_type = loss_type
 
@@ -75,12 +79,15 @@ class Trainer:
 
         self.save_every = save_every
         self.gen_ema_beta = gen_ema_beta
+        self.compute_generator_ema = compute_generator_ema
+        self.grad_accum_steps = grad_accum_steps
+
         self.disc_optim_steps = disc_optim_steps
         self.lazy_reg_steps_generator = lazy_reg_steps_generator
         self.lazy_reg_steps_discriminator = lazy_reg_steps_discriminator
-        self.next_d_step = 16
-        self.next_g_step = 1
-        # Terminate when self.next_g_step > self.total_steps
+        self.d_steps = 0
+        self.g_steps = 0
+        # Terminate when self.g_steps == self.total_steps
     
         # TODO: Cover cases when loading from checkpoints
         if checkpoint_path is not None:
@@ -97,21 +104,9 @@ class Trainer:
             self.G = G.to(device)
             self.D = D.to(device)
 
-            self.MNE = copy.deepcopy(self.MN).eval()
-            self.GE = copy.deepcopy(self.G).eval()
-
-            # Turn off gradient computation for generator EMWA
-            requires_grad(self.MNE, False)
-            requires_grad(self.GE, False)
-
-            # Initialize all parameters of exponential moving average models to 0
-            # TODO: When implementing truncation trick, don't forget to copy w_avg buffer into EMA w_avg buffer without applying EMA update rule!
-            for param in self.MNE.parameters():
-                param.data = torch.zeros_like(param.data)
-
-            for param in self.GE.parameters():
-                param.data = torch.zeros_like(param.data)
-
+            self.MNE = copy.deepcopy(self.MN).to(device).eval()
+            self.GE = copy.deepcopy(self.G).to(device).eval()
+                
             g_scale = (self.lazy_reg_steps_generator) / (self.lazy_reg_steps_generator + 1)
             d_scale = (self.lazy_reg_steps_discriminator) / (self.lazy_reg_steps_discriminator + 1)
 
@@ -121,49 +116,89 @@ class Trainer:
             self.optim_G = torch.optim.Adam(G.parameters(), lr = learning_rate * g_scale, betas = (adam_beta1 ** g_scale, adam_beta2 ** g_scale), eps = adam_eps)
             self.optim_D = torch.optim.Adam(D.parameters(), lr = learning_rate * d_scale, betas = (adam_beta1 ** d_scale, adam_beta2 ** d_scale), eps = adam_eps)
 
-    def discriminator_step(self, real_samples : torch.Tensor) -> None:
-        start = time.time()
-        requires_grad(self.D, True)
-        requires_grad(self.G, False)
-        requires_grad(self.MN, False)
-        b, c, h, w = real_samples.shape
-        device = real_samples.get_device()
-        should_reg = self.lazy_reg_steps_discriminator > 0 and self.next_d_step % self.lazy_reg_steps_discriminator == 0
+            if not os.path.exists(self.root_path):
+                os.mkdir(self.root_path)
 
-        # Potentially required for gradient penalty
-        real_samples.requires_grad_(should_reg)
-        real_pred = self.D(real_samples)
-        w, _, _ = generate_style_mixes(self.MN, h, b, device)
-        fake_samples = self.G(w, generate_noise(h, b, device))
-        fake_pred = self.D(fake_samples)
-
-        d_loss = self.D_loss(real_pred, fake_pred)
-
-        if should_reg:
-            # Use R1 gradient penalty for vanilla GAN loss            
-            if self.loss_type == "vanilla":
-                print(real_pred)
-                d_loss += self.D_gp(real_samples, real_pred) 
-
-            # For WGAN loss we use GP penalty, norm deviations from 1 and fake/real interpolation
-            else:
-                w, _, _ = generate_style_mixes(self.MN, h, b, device)
-                fake_samples = self.G(w, generate_noise(h, b, device))
-                d_loss += self.D_gp(real_samples, real_pred = None, fake_samples = fake_samples, critic = self.D)
-
-            real_samples.requires_grad_(False)
-
-        d_loss.backward()
-        self.optim_D.step()
+    # Make private once initial tests are done
+    def discriminator_step(self) -> Tuple[float, float]:
         self.optim_D.zero_grad()
-        self.next_d_step += 1
+        should_reg = self.lazy_reg_steps_discriminator > 0 and (self.d_steps + 1) % self.lazy_reg_steps_discriminator == 0
 
-        print(f"Time taken for discriminator step: {time.time() - start:.4f}s.")
+        d_loss, gp_loss = 0, 0
 
-    def __generator_step(self):
-        pass
+        for _ in range(self.grad_accum_steps):
+            real_samples = next(self.train_loader).to(self.device)
+            # Potential gradient penalty computation
+            real_samples.requires_grad_(should_reg)
+
+            real_pred = self.D(real_samples)
+            ws, _, _ = generate_style_mixes(self.MN, self.target_resolution, self.batch_size, self.device, style_mixing_prob = self.style_mixing_prob)
+            ws = ws.detach() # Detach mapping network from computational graph
+            fake_samples = self.G(ws, generate_noise(self.target_resolution, self.batch_size, self.device)).detach() # Detach generator from computational graph
+            fake_pred = self.D(fake_samples)
+
+            current_d_loss = self.D_loss(real_pred, fake_pred) / self.grad_accum_steps
+            current_gp_loss = 0
+
+            d_loss += current_d_loss.item()
+
+            if should_reg:
+                # Use R1 gradient penalty for vanilla GAN loss            
+                if self.loss_type == "vanilla":
+                    current_gp_loss = self.D_gp(real_samples, real_pred) / self.grad_accum_steps
+                    gp_loss += current_gp_loss.detach()
+
+                # For WGAN loss we use GP penalty, norm deviations from 1 and fake/real interpolation
+                else:
+                    ws, _, _ = generate_style_mixes(self.MN, self.target_resolution, self.batch_size, self.device)
+                    fake_samples = self.G(ws, generate_noise(self.target_resolution, self.batch_size, self.device))
+                    current_gp_loss = self.D_gp(real_samples, real_pred = None, fake_samples = fake_samples, critic = self.D) / self.grad_accum_steps
+                    gp_loss += current_gp_loss.detach()
+                
+            
+            current_loss = current_d_loss + current_gp_loss
+            current_loss.backward()
+
+        self.optim_D.step()
+        self.d_steps += 1
+        return d_loss, gp_loss
+
+    # Make private once initial tests are done
+    def generator_step(self) -> Tuple[float, float]:
+        self.optim_MN.zero_grad()
+        self.optim_G.zero_grad()
+
+        should_reg = self.lazy_reg_steps_generator > 0 and (self.g_steps + 1) % self.lazy_reg_steps_generator == 0
+
+        g_loss, plr_loss = 0, 0
+
+        for _ in range(self.grad_accum_steps):
+            ws, _, _ = generate_style_mixes(self.MN, self.target_resolution, self.batch_size, self.device, style_mixing_prob = self.style_mixing_prob)
+            fake_samples = self.G(ws, generate_noise(self.target_resolution, self.batch_size, self.device))
+            fake_pred = self.D(fake_samples)
+
+            current_g_loss = self.G_loss(fake_pred) / self.grad_accum_steps
+            current_plr_loss = 0
+
+            g_loss += current_g_loss.detach()
+
+            # Apparently path length regularization uses new fake samples from generator?
+            # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/loss.py#L77
+            if should_reg:
+                ws, _, _ = generate_style_mixes(self.MN, self.target_resolution, self.batch_size, self.device, style_mixing_prob = self.style_mixing_prob)
+                fake_samples = self.G(ws, generate_noise(self.target_resolution, self.batch_size, self.device))
+                current_plr_loss = self.G_plr(ws, fake_samples)  / self.grad_accum_steps
+                plr_loss += current_plr_loss.detach()
+            
+            current_loss = current_g_loss + current_plr_loss
+            current_loss.backward()
+
+        self.optim_MN.step()
+        self.optim_G.step()
+        self.g_steps += 1
+        return g_loss, plr_loss
     
-    def __ema_step(self):
+    def __ema_generator_step(self):
         """
         Perform exponential moving average update of Generator weights (including the mapping network), using gen_ema_coeff. 
         This was first introduced, to my knowledge at least in ProGAN paper, https://arxiv.org/pdf/1710.10196. Another paper goes into mathematical details
@@ -173,37 +208,60 @@ class Trainer:
         https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/training_loop.py#L297. However, for default values, this defaults to exponential moving
         average decay of approximately 0.999, which is the same as in ProGAN paper.
         """
-        for param, ema_param in zip(self.MN.parameters(), self.MNE.parameters()):
-            ema_param.data = torch.lerp(param.data, ema_param.data, self.gen_ema_beta)
+        with torch.no_grad():
+            for param, ema_param in zip(self.MN.parameters(), self.MNE.parameters()):
+                if param.requires_grad:
+                    ema_param = torch.lerp(param, ema_param, self.gen_ema_beta)
+                
+                else:
+                    ema_param.copy_(param)
 
-        for param, ema_param in zip(self.G.parameters(), self.GE.parameters()):
-            ema_param.data = torch.lerp(param.data, ema_param.data, self.gen_ema_beta)
-        
-        for buffer, ema_buffer in zip(self.MN.buffers(), self.MNE.buffers()):
-            ema_buffer.copy_(buffer)
-        
-        for buffer, ema_buffer in zip(self.G.buffers(), self.GE.buffers()):
-            ema_buffer.copy_(buffer)
+            for param, ema_param in zip(self.G.parameters(), self.GE.parameters()):
+                if param.requires_grad:
+                    ema_param = torch.lerp(param, ema_param, self.gen_ema_beta)
+                
+                else:
+                    ema_param.copy_(param)
 
-def cycle_data_loader(dl):
-    while True:
-        for sample in dl:
-            yield sample
+    def train(self, truncation_psi_inference = 0.7, style_mixing_prob_inference = 0.9, num_images_inference : int = 16, num_generated_rows : int = 1):
+        
+        pbar = tqdm.tqdm(range(self.g_steps, self.total_steps), position = 0, leave = True)
+        for i in pbar:
+            for j in range(self.disc_optim_steps):
+                l, r = self.discriminator_step()
+                pbar.write(f"Discriminator step: {self.d_steps}. Network loss: {l}. Regularization loss: {r}")
+
+            l, r = self.generator_step()
+            pbar.write(f"Generator step: {self.g_steps}. Network loss: {l}. Regularization loss: {r}")
+
+            if self.compute_generator_ema:
+                self.__ema_generator_step()
+            
+            if self.g_steps % self.save_every == 0:
+                # Inference only for now
+                with torch.no_grad():
+                    fake_samples = generate_samples(self.GE, self.MNE, self.target_resolution, num_images_inference, self.device,
+                                                    style_mixing_prob = style_mixing_prob_inference,
+                                                    truncation_psi = truncation_psi_inference,
+                                                    update_w_ema = True,
+                                                    num_generated_rows = num_generated_rows)
+                    
+                    Image.fromarray(fake_samples, mode = "RGB").save(os.path.join(self.root_path, f"output_{self.g_steps}.jpg"))
 
 if __name__ == "__main__":
-    dataset = Dataset("celeba_128_v2", alpha = 1)
+    DEVICE = "cuda"
+    target_res = 128
+    mn = MappingNetwork(512, 8).to(DEVICE)
+    g = Generator(128, 512, use_tanh_last = True).to(DEVICE)
+    d = Discriminator(128, 3).to(DEVICE)
+
+    num_images = 1e5
+    steps = math.ceil(num_images // 128)
+
+    dataset = Dataset("celeba_128_v2")
     dl = get_data_loader(dataset, 32)
-    dl = cycle_data_loader(dl)
 
-    len_dl = math.ceil(len(dataset) / 32)
-    iters = []
-
-    print(len_dl)
-
-    for i in range(2 * len_dl):
-        iters.append(next(dl))
-    
-    print(len(iters))
-
-    for i in range(0, len_dl):
-        print(torch.allclose(iters[i], iters[i + len_dl]))
+    t = Trainer(mn, g, d, "first_model", dl, dl, steps, DEVICE, 128, 32, loss_type = "vanilla", save_every = 100, learning_rate = 2e-3, grad_accum_steps = 4)
+    t.train(num_generated_rows = 4)
+    # samples = generate_samples(g, mn, 128, 16, DEVICE, style_mixing_prob = 0, num_generated_rows = 4)
+    # Image.fromarray(samples, mode = "RGB").show()

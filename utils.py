@@ -1,5 +1,7 @@
 import torch
 import math
+import numpy as np
+
 from typing import List, Union, Tuple
 
 def generate_style_mixes(
@@ -48,3 +50,36 @@ def generate_noise(target_resolution : int, batch_size : int, device : str) -> L
         [(torch.randn(batch_size, 1, 2 ** i, 2 ** i).to(device), torch.randn(batch_size, 1, 2 ** i, 2 ** i).to(device)) for i in range(3, int(math.log2(target_resolution) + 1))]
     
     return z
+
+def generate_samples(
+        generator, 
+        mapping_network, target_resolution : int, 
+        num_samples : int, 
+        device : str, 
+        style_mixing_prob : float = 0.9,
+        truncation_psi : float = 1.0,
+        update_w_ema : bool = False,
+        num_generated_rows : int = 1):
+    
+    w, _, _ = generate_style_mixes(mapping_network, 
+                                   target_resolution, 
+                                   num_samples, 
+                                   device, 
+                                   style_mixing_prob = style_mixing_prob, 
+                                   truncation_psi = truncation_psi, 
+                                   update_w_ema = update_w_ema)
+    
+    fake_samples = generator(w, generate_noise(target_resolution, num_samples, device))
+    fake_samples = ((fake_samples + 1) * 127.5).cpu().detach().numpy()
+    fake_samples = np.rint(fake_samples).clip(0, 255).astype(np.uint8)
+
+    assert num_samples % num_generated_rows == 0
+
+    gh = num_samples // num_generated_rows
+    gw = num_samples // gh
+    _, C, H, W = fake_samples.shape
+
+    fake_samples = fake_samples.reshape(gh, gw, C, H, W)
+    fake_samples = fake_samples.transpose(0, 3, 1, 4, 2) # (gh, H, gw, W, C)
+    fake_samples = fake_samples.reshape(gh * H, gw * W, C)
+    return fake_samples

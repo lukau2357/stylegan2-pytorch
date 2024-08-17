@@ -16,6 +16,7 @@ def leaky_relu(p : float = 0.2):
 def get_leaky_relu_gain(p : float = 0.2):
     return (2 / (1 + p ** 2)) ** 0.5
     # return 2 ** 0.5
+    # return 1
 
 class EqualizedWeight(torch.nn.Module):
     """
@@ -111,13 +112,18 @@ class MappingNetwork(torch.nn.Module):
 
         self.net = torch.nn.Sequential(*layers)
 
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
     def forward(self, z : torch.Tensor, truncation_psi : float = 1, update_w_ema : bool = False) -> torch.Tensor:
         """
         z: (batch_size, latent_dim). 
         Return:
             w: (batch_size, latent_dim)
         """
-        z = torch.nn.functional.normalize(z, dim = 1)
+
+        # z = torch.nn.functional.normalize(z, dim = 1)
+        z = z / (torch.sqrt(z.square().mean(dim = 1, keepdim = True) + 1e-8))
         w = self.net(z)
 
         if update_w_ema:
@@ -200,7 +206,7 @@ class StyleBlock(torch.nn.Module):
         """
         style_scales = self.style_scale_map(w)
         X = self.conv(X, style_scales)
-        return self.activation(X + self.noise_bias[None, :, None, None] + (self.noise_scale * noise))
+        return self.activation(X + self.noise_bias[None, :, None, None] + (self.noise_scale[None, :, None, None] * noise))
 
 class ToRgb(torch.nn.Module):
     """
@@ -287,7 +293,7 @@ class Downsample(torch.nn.Module):
         return self.downsample(self.smooth(X))
 
 class Generator(torch.nn.Module):
-    def __init__(self, image_size : int, latent_dim : int, network_capacity : int = 8, max_features : int = 512, fir_filter : List[int] = [1, 3, 3, 1], use_tanh_last : bool = True):
+    def __init__(self, image_size : int, latent_dim : int, network_capacity : int = 8, max_features : int = 512, fir_filter : List[int] = [1, 3, 3, 1], use_tanh_last : bool = False):
         super().__init__()
         self.image_size = image_size
         self.latent_dim = latent_dim
@@ -304,6 +310,9 @@ class Generator(torch.nn.Module):
         self.use_tanh_last = use_tanh_last
         self.blocks = torch.nn.ModuleList([GeneratorBlock(self.filters[i - 1], self.filters[i], latent_dim) for i in range(1, len(self.filters))])
         self.upsample = Upsample(fir_filter = fir_filter)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def forward(self, w : torch.Tensor, noise : List[Tuple[torch.Tensor]]) -> torch.Tensor:
         """
@@ -485,6 +494,9 @@ class Discriminator(torch.nn.Module):
         # TODO: Last resolution hardcoded to 4, perhaps make it dynamic somehow?
         self.last = DiscriminatorEpilogue(self.filters[-1], 4, use_mbstd = use_mbstd, mbstd_group_size = mbstd_group_size, mbstd_num_channels = mbstd_num_channels)
     
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
     def forward(self, X : torch.Tensor) -> torch.Tensor:
         """
         X: (batch_size, 3, h, w)
@@ -493,87 +505,8 @@ class Discriminator(torch.nn.Module):
         X = self.disc_blocks(X)
         return self.last(X)
 
-# TODO: This class is redundant, should be removed! Keep only number of parameters
-class StyleGAN2(torch.nn.Module):
-    def __init__(self, 
-                 latent_dim : int, 
-                 target_resolution : int, 
-                 mlp_depth : int = 8, 
-                 mlp_lr_multiplier : float = 0.01, 
-                 network_capacity : int = 8, 
-                 max_features : int = 512, 
-                 gen_ema_coeff : float = 0.999,
-                 use_mbstd : bool = True, 
-                 mbstd_group_size : int = 4, 
-                 mbstd_num_channels : int = 1,
-                 fir_filter : List[int] = [1, 3, 3, 1],
-                 use_tanh_last : bool = True):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.target_resolution = target_resolution
-        self.mlp_depth = mlp_depth
-        self.ml_lr_multiplier = mlp_lr_multiplier
-        self.network_capacity = network_capacity
-        self.max_features = max_features
-        self.gen_ema_coeff = gen_ema_coeff
-        self.use_mbstd = use_mbstd
-        self.mbstd_group_size = mbstd_group_size
-        self.mbstd_num_channels = mbstd_num_channels
-
-        self.MN = MappingNetwork(latent_dim, mlp_depth, lr_mul = mlp_lr_multiplier)
-        self.G = Generator(target_resolution, latent_dim, network_capacity = network_capacity, max_features = max_features, fir_filter = fir_filter, use_tanh_last = use_tanh_last)
-        self.D = Discriminator(target_resolution, 3, network_capacity = network_capacity, max_features = max_features, use_mbstd = use_mbstd, mbstd_group_size = mbstd_group_size, mbstd_num_channels = mbstd_num_channels, fir_filter = fir_filter)
-        # Exponential moving average of generator weights during training, will be ultimately used for final inference.
-
-        self.GE = Generator(target_resolution, latent_dim, network_capacity = network_capacity, max_features = max_features, fir_filter = fir_filter, use_tanh_last = use_tanh_last)
-        self.MNE = MappingNetwork(latent_dim, mlp_depth, lr_mul = mlp_lr_multiplier)
-
-        # Initialize all exponential moving average parameters to 0
-        for ge_param in self.GE.parameters():
-            ge_param.data = torch.zeros_like(ge_param.data)
-        
-        for mne_param in self.MNE.parameters():
-            mne_param.data = torch.zeros_like(mne_param.data)
-
-    def EMA(self):
-        """
-        Perform exponential moving average update of Generator weights (including the mapping network), using gen_ema_coeff. 
-        This was first introduced, to my knowledge at least in ProGAN paper, https://arxiv.org/pdf/1710.10196. Another paper goes into mathematical details
-        of why this works: https://arxiv.org/pdf/1806.04498
-
-        Based on StyleGAN-2 implementation, they use exponential decay based on hyperparameters that can be found in 
-        https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/training_loop.py#L297. However, for default values, this defaults to exponential moving
-        average decay of approximately 0.999, which is the same as in ProGAN paper.
-        """
-        for g_param, ge_param in zip(self.G.parameters(), self.GE.parameters()):
-            p_new = g_param.data
-            p_old = ge_param.data
-            ge_param.data = self.gen_ema_coeff * p_old + (1 - self.gen_ema_coeff) * p_new
-        
-    def num_parameters(self, verbose : bool = True) -> Tuple[int, int, int]:
-        gen_params, mapping_params, disc_params = 0, 0, 0
-        def __count_parameters(model):
-            return sum(p.numel() for p in model.parameters() if p.requires_grad)
-        
-        gen_params = __count_parameters(self.G)
-        mapping_params = __count_parameters(self.MN)
-        disc_params = __count_parameters(self.D)
-
-        if verbose:
-            print(f"Number of mapping network parameters: {mapping_params / 1e6:.2f}M")
-            print(f"Number of generator parameters: {gen_params / 1e6:.2f}M")
-            print(f"Number of discriminator/critic parameters: {disc_params / 1e6:.2f}M")
-        
-        return gen_params, mapping_params, disc_params
-
-    def generate_samples(self, num_samples : int, device : str) -> torch.Tensor:
-        """
-        Generates num_samples from generator, without performing style mixing.
-        """
-        z = torch.randn((num_samples, self.latent_dim), device = device)
-        w = self.MNE(z)
-
-        return self.G(w, generate_noise(self.target_resolution, w.shape[1], device))
-
 if __name__ == "__main__":
-    sgan1 = StyleGAN2(512, 128, 8)
+    x = EqualizedWeight((5, 3, 3, 3))
+    x1 = x.weight.data
+    x2 = x()
+    print(torch.allclose(x1, x2))

@@ -59,12 +59,13 @@ class GradientPenalty(torch.nn.Module):
             real_pred = critic(real)
         
         grad, = torch.autograd.grad(inputs = real, outputs = real_pred.sum(), create_graph = True)
-        norm = torch.sqrt(torch.sum(grad ** 2, dim = (1, 2, 3)))
+        norm = torch.sum(grad ** 2, dim = (1, 2, 3))
 
         if self.gp_type == "wgan-gp":
+            norm = torch.sqrt(norm)
             return self.reg_weight * ((norm - 1) ** 2).mean()
 
-        return (self.reg_weight / 2) * (norm ** 2).mean()
+        return (self.reg_weight / 2) * norm.mean()
 
 class PathLengthPenalty(torch.nn.Module):
     def __init__(self, reg_weight = 2.0, beta = 0.99):
