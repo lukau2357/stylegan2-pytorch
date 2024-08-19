@@ -45,41 +45,61 @@ def generate_style_mixes(
     
     return torch.stack(w_sm, dim = 1), ws, crossovers
 
+def new_style_mixing(mapping_network, num_samples, device, style_mixing_prob, num_ws : int, update_w_ema : bool = True, truncation_psi : float = 1):
+    z = torch.randn((num_samples, mapping_network.latent_dim)).to(device)
+    w = mapping_network(z, update_w_ema = update_w_ema, truncation_psi = truncation_psi).unsqueeze(0).repeat(num_ws, 1, 1)
+
+    if style_mixing_prob > 0:
+        cutoff = torch.empty([], dtype = torch.int64, device = device).random_(1, num_ws) # Random integer in range [1, num_ws - 1]
+        cutoff = torch.where(torch.rand([], device = device) < style_mixing_prob, cutoff, torch.full_like(cutoff, num_ws)) # Uses same cutoff for all samples in the batch
+        # Do not update w_ema in tyle mixing pass, as per official implementation:
+        # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/d72cc7d041b42ec8e806021a205ed9349f87c6a4/training/loss.py#L45
+        w[cutoff:] = mapping_network(torch.randn_like(z), update_w_ema = False, truncation_psi = truncation_psi).unsqueeze(0).repeat(num_ws - cutoff, 1, 1)
+
+    # TODO: Return tuple, obtained style mixes, style vectors that generated the mixes, and cutoff point
+    return w, None, None
+
 def generate_noise(target_resolution : int, batch_size : int, device : str) -> List[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
     z = [torch.randn(batch_size, 1, 4, 4).to(device)] + \
         [(torch.randn(batch_size, 1, 2 ** i, 2 ** i).to(device), torch.randn(batch_size, 1, 2 ** i, 2 ** i).to(device)) for i in range(3, int(math.log2(target_resolution) + 1))]
     
     return z
 
+def samples_to_grid(samples : torch.Tensor, num_rows : int) -> np.ndarray:
+    samples = ((samples + 1) * 127.5).cpu().detach().numpy()
+    samples = np.rint(samples).clip(0, 255).astype(np.uint8)
+    num_samples = samples.shape[0]
+
+    assert num_samples % num_rows == 0
+
+    gh = num_samples // num_rows
+    gw = num_samples // gh
+    _, C, H, W = samples.shape
+
+    samples = samples.reshape(gh, gw, C, H, W)
+    samples = samples.transpose(0, 3, 1, 4, 2) # (gh, H, gw, W, C)
+    samples = samples.reshape(gh * H, gw * W, C)
+    return samples
+
 def generate_samples(
         generator, 
-        mapping_network, target_resolution : int, 
-        num_samples : int, 
+        mapping_network, 
+        target_resolution : int, 
         device : str, 
+        num_samples : int,
+        num_ws : int,
         style_mixing_prob : float = 0.9,
         truncation_psi : float = 1.0,
         update_w_ema : bool = False,
         num_generated_rows : int = 1):
     
-    w, _, _ = generate_style_mixes(mapping_network, 
-                                   target_resolution, 
-                                   num_samples, 
-                                   device, 
-                                   style_mixing_prob = style_mixing_prob, 
-                                   truncation_psi = truncation_psi, 
-                                   update_w_ema = update_w_ema)
-    
+    w, _, _ = new_style_mixing(mapping_network, 
+                                num_samples, 
+                                device, 
+                                style_mixing_prob,
+                                num_ws,
+                                update_w_ema = update_w_ema,
+                                truncation_psi = truncation_psi)
+        
     fake_samples = generator(w, generate_noise(target_resolution, num_samples, device))
-    fake_samples = ((fake_samples + 1) * 127.5).cpu().detach().numpy()
-    fake_samples = np.rint(fake_samples).clip(0, 255).astype(np.uint8)
-
-    assert num_samples % num_generated_rows == 0
-
-    gh = num_samples // num_generated_rows
-    gw = num_samples // gh
-    _, C, H, W = fake_samples.shape
-
-    fake_samples = fake_samples.reshape(gh, gw, C, H, W)
-    fake_samples = fake_samples.transpose(0, 3, 1, 4, 2) # (gh, H, gw, W, C)
-    fake_samples = fake_samples.reshape(gh * H, gw * W, C)
-    return fake_samples
+    return samples_to_grid(fake_samples, num_generated_rows)

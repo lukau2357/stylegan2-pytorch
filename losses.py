@@ -8,7 +8,7 @@ class VanillaDiscriminatorLoss(torch.nn.Module):
         super().__init__()
     
     def forward(self, real_pred : torch.Tensor, fake_pred : torch.Tensor) -> torch.Tensor:
-        return F.binary_cross_entropy_with_logits(real_pred, torch.ones_like(real_pred)) + F.binary_cross_entropy_with_logits(fake_pred, torch.zeros_like(fake_pred))
+        return (F.softplus(-real_pred) + F.softplus(fake_pred)).mean()
 
 class VanillaGeneratorLossNS(torch.nn.Module):
     """
@@ -18,7 +18,7 @@ class VanillaGeneratorLossNS(torch.nn.Module):
         super().__init__()
     
     def forward(self, fake_pred : torch.Tensor) -> torch.Tensor:
-        return F.binary_cross_entropy_with_logits(fake_pred, torch.ones_like(fake_pred)).mean()
+        return F.softplus(-fake_pred).mean()
     
 class WGANDiscriminatorLoss(torch.nn.Module):
     """

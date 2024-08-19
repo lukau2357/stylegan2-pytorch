@@ -4,18 +4,29 @@ import math
 import torchvision
 
 from typing import Tuple, List, Union
-from utils import generate_noise, generate_style_mixes
+from utils import generate_noise, generate_style_mixes, samples_to_grid, new_style_mixing
 from PIL import Image
 
-def leaky_relu(p : float = 0.2):
-    return torch.nn.LeakyReLU(negative_slope = p)
+class LeakyReLUGained(torch.nn.Module):
+    def __init__(self, p : float = 0.2, gain : float = 1):
+        super().__init__()
+        self.p = p
+        self.gain = gain
+        self.lrelu = torch.nn.LeakyReLU(negative_slope = p)
+    
+    def forward(self, X : torch.Tensor) -> torch.Tensor:
+        return self.gain * self.lrelu(X)
+
+def leaky_relu(p : float = 0.2, gain : float = 1):
+    # return torch.nn.LeakyReLU(negative_slope = p)
+    return LeakyReLUGained(p = p, gain = gain)
 
 # StyleGAN2-ADA implementation uses sqrt(2) gain for LeakyReLU as well, even though it depends on chosen negative slope
 # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/torch_utils/ops/bias_act.py#L23
 # We've set it to actual gain, for the time being.
 def get_leaky_relu_gain(p : float = 0.2):
-    return (2 / (1 + p ** 2)) ** 0.5
-    # return 2 ** 0.5
+    # return (2 / (1 + p ** 2)) ** 0.5
+    return 2 ** 0.5
     # return 1
 
 class EqualizedWeight(torch.nn.Module):
@@ -30,7 +41,8 @@ class EqualizedWeight(torch.nn.Module):
             shape - Desired shape that weights should take
         """
         super().__init__()
-        self.c = gain * np.prod(shape[1:]) ** (-0.5)
+        self.c = np.prod(shape[1:]) ** (-0.5)
+        self.gain = gain
         self.lr_mul = lr_mul
         self.weight = torch.nn.Parameter(torch.randn(shape) / lr_mul) # Dividing by lr_mul here and multiplying in the forward pass ensures that X has standard deviation c.
 
@@ -108,22 +120,22 @@ class MappingNetwork(torch.nn.Module):
         layers = []
 
         for _ in range(depth):
-            layers.extend([EqualizedLinear(latent_dim, latent_dim, gain = get_leaky_relu_gain(), lr_mul = lr_mul), leaky_relu()])
+            # try removing gain here, from now
+            layers.extend([EqualizedLinear(latent_dim, latent_dim, lr_mul = lr_mul), leaky_relu(gain = get_leaky_relu_gain())])
 
         self.net = torch.nn.Sequential(*layers)
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def forward(self, z : torch.Tensor, truncation_psi : float = 1, update_w_ema : bool = False) -> torch.Tensor:
+    def forward(self, z : torch.Tensor, truncation_psi : float = 1, update_w_ema : bool = True) -> torch.Tensor:
         """
         z: (batch_size, latent_dim). 
         Return:
             w: (batch_size, latent_dim)
         """
 
-        # z = torch.nn.functional.normalize(z, dim = 1)
-        z = z / (torch.sqrt(z.square().mean(dim = 1, keepdim = True) + 1e-8))
+        z = z / (torch.sqrt(z.square().mean(dim = 1, keepdim = True) + 1e-8)) # RMS-norm-esque
         w = self.net(z)
 
         if update_w_ema:
@@ -150,7 +162,7 @@ class Conv2dModulation(torch.nn.Module):
         self.kernel_size = kernel_size
         self.stride = stride
         self.dilation = dilation
-        self.weight = EqualizedWeight((out_channels, in_channels, kernel_size, kernel_size), gain = kwargs.get("gain", 1.0))
+        self.weight = EqualizedWeight((out_channels, in_channels, kernel_size, kernel_size))
         self.eps = eps
         self.padding = padding
 
@@ -194,9 +206,9 @@ class StyleBlock(torch.nn.Module):
 
         self.style_scale_map = EqualizedLinear(latent_dim, in_channels, bias = 1.)
         self.noise_bias = torch.nn.Parameter(torch.zeros((out_channels)))
-        self.noise_scale = torch.nn.Parameter(torch.zeros(1))
-        self.conv = Conv2dModulation(in_channels, out_channels, 3, gain = get_leaky_relu_gain())
-        self.activation = leaky_relu()
+        self.noise_scale = torch.nn.Parameter(torch.zeros([]))
+        self.conv = Conv2dModulation(in_channels, out_channels, 3)
+        self.activation = leaky_relu(gain = get_leaky_relu_gain())
 
     def forward(self, X : torch.Tensor, w : torch.Tensor, noise : torch.Tensor) -> torch.Tensor:
         """
@@ -206,7 +218,7 @@ class StyleBlock(torch.nn.Module):
         """
         style_scales = self.style_scale_map(w)
         X = self.conv(X, style_scales)
-        return self.activation(X + self.noise_bias[None, :, None, None] + (self.noise_scale[None, :, None, None] * noise))
+        return self.activation(X + self.noise_bias[None, :, None, None] + (self.noise_scale * noise))
 
 class ToRgb(torch.nn.Module):
     """
@@ -316,7 +328,7 @@ class Generator(torch.nn.Module):
 
     def forward(self, w : torch.Tensor, noise : List[Tuple[torch.Tensor]]) -> torch.Tensor:
         """
-        w: (2 * (log2(image_size) - 1), batch_size, latent_dim) - First dimension determines which style vector is taken for which affine map. This encompasses 
+        w: (2 * (log2(image_size)) - 2), batch_size, latent_dim) - First dimension determines which style vector is taken for which affine map. This encompasses 
         style mixing regularization as well as passing a single style vector to all affine maps in the generator.
 
         noise: List of tuples of noises to add to generated images of differing resolutions throughout the network. First element of the list is a tuple 
@@ -373,9 +385,9 @@ class DiscriminatorBlock(torch.nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.skip_conv = EqualizedConv2d(in_channels, out_channels, 1, bias = False)
-        self.conv1 = EqualizedConv2d(in_channels, in_channels, 3, gain = get_leaky_relu_gain())
-        self.conv2 = EqualizedConv2d(in_channels, out_channels, 3, stride = 2, padding = 1, gain = get_leaky_relu_gain())
-        self.activation = leaky_relu()
+        self.conv1 = EqualizedConv2d(in_channels, in_channels, 3)
+        self.conv2 = EqualizedConv2d(in_channels, out_channels, 3, stride = 2, padding = 1)
+        self.activation = leaky_relu(gain = get_leaky_relu_gain())
         self.smooth = Smooth(fir_filter = fir_filter)
         self.ds = Downsample(fir_filter = fir_filter)
 
@@ -441,10 +453,10 @@ class DiscriminatorEpilogue(torch.nn.Module):
         if self.use_mbstd:
             self.mbstd = MiniBatchStd(group_size = mbstd_group_size, num_channels = mbstd_num_channels)
 
-        self.conv = EqualizedConv2d(self.in_channels + self.mbstd_num_channels if self.use_mbstd else self.in_channels, self.in_channels, 3, gain = get_leaky_relu_gain())
-        self.lrelu = leaky_relu()
+        self.conv = EqualizedConv2d(self.in_channels + self.mbstd_num_channels if self.use_mbstd else self.in_channels, self.in_channels, 3)
+        self.lrelu = leaky_relu(gain = get_leaky_relu_gain())
         self.fc = torch.nn.Sequential(
-            EqualizedLinear(in_channels * resolution ** 2, in_channels, gain = get_leaky_relu_gain()),
+            EqualizedLinear(in_channels * resolution ** 2, in_channels),
             self.lrelu,
             EqualizedLinear(in_channels, 1)
         )
@@ -481,12 +493,12 @@ class Discriminator(torch.nn.Module):
         self.res_log = int(math.log2(self.input_res))
         # Use same channel shrinking/expanding strategy as with Generator. Fits Table 2 of ProGAN paper when network_capacity = 8 and input_res = 1024
         self.filters = [min(max_features, network_capacity * 2 ** (i + 1)) for i in range(self.res_log - 1)]
-        self.lrelu = leaky_relu()
+        self.lrelu = leaky_relu(gain = get_leaky_relu_gain())
 
         # FromRGB extends the number of channels to self.filters[0] with kernel size 1, with Leaky ReLU application.
         # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/networks.py#L543
         # For now, working with RGB images only - 3 input chanels that is.
-        self.from_rgb = torch.nn.Sequential(EqualizedConv2d(3, self.filters[0], 1, gain = get_leaky_relu_gain()), self.lrelu)
+        self.from_rgb = torch.nn.Sequential(EqualizedConv2d(3, self.filters[0], 1), self.lrelu)
         self.disc_blocks = torch.nn.Sequential(*[
             DiscriminatorBlock(self.filters[i], self.filters[i + 1], fir_filter = fir_filter) for i in range(len(self.filters) - 1)
         ])
@@ -506,7 +518,30 @@ class Discriminator(torch.nn.Module):
         return self.last(X)
 
 if __name__ == "__main__":
-    x = EqualizedWeight((5, 3, 3, 3))
-    x1 = x.weight.data
-    x2 = x()
-    print(torch.allclose(x1, x2))
+    '''
+    DEVICE = "cuda"
+    g = Generator(128, 512).to(DEVICE)
+    mn = MappingNetwork(512, 8).to(DEVICE)
+    # w, _, _ = generate_style_mixes(mn, 128, 16, DEVICE)
+    z = torch.randn((16, 512), device = DEVICE).unsqueeze(0).repeat(2 * g.num_layers, 1, 1)
+    w, _, _ = new_style_mixing(mn, 16, DEVICE, 0.8, z.shape[0])
+
+    noise = generate_noise(128, 16, DEVICE)
+
+    images_z = g.forward(z, noise)
+    images_w = g.forward(w, noise)
+
+    images_z = samples_to_grid(images_z, 4)
+    images_w = samples_to_grid(images_w, 4)
+
+    Image.fromarray(images_z, mode = "RGB").save("z_images.jpg")
+    Image.fromarray(images_w, mode = "RGB").save("w_images.jpg")
+    '''
+    x = EqualizedWeight((3, 8, 3, 3))
+
+    y = x.weight.data
+    z = x().data
+    print(y)
+    print()
+    print(z)
+    print(torch.allclose(y, z))
