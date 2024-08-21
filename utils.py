@@ -66,7 +66,7 @@ def generate_noise(target_resolution : int, batch_size : int, device : str) -> L
     return z
 
 def samples_to_grid(samples : torch.Tensor, num_rows : int) -> np.ndarray:
-    samples = ((samples + 1) * 127.5).cpu().detach().numpy()
+    samples = ((samples + 1) * 127.5).cpu().detach().numpy() # Back to (0, 255) with clipping
     samples = np.rint(samples).clip(0, 255).astype(np.uint8)
     num_samples = samples.shape[0]
 

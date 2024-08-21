@@ -7,3 +7,5 @@ __pycache__/**
 celeba_128_v2/
 celeba_256_v2/
 first_model/*
+celeba*/
+wandb_demo.py

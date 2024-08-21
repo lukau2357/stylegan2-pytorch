@@ -3,7 +3,7 @@ import numpy as np
 import math
 import torchvision
 
-from typing import Tuple, List, Union
+from typing import Tuple, List, Union, Type
 from utils import generate_noise, generate_style_mixes, samples_to_grid, new_style_mixing
 from PIL import Image
 
@@ -127,6 +127,20 @@ class MappingNetwork(torch.nn.Module):
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def to_dict(self) -> dict:
+        d = {
+            "latent_dim": self.latent_dim,
+            "depth": self.depth,
+            "lr_mul": self.lr_mul,
+            "w_ema_beta": self.w_ema_beta
+        }
+
+        return d
+
+    @classmethod
+    def from_dict(cls : Type["MappingNetwork"], d) -> Type["MappingNetwork"]:
+        return cls(d["latent_dim"], d["depth"], d["lr_mul"], d["w_ema_beta"])
 
     def forward(self, z : torch.Tensor, truncation_psi : float = 1, update_w_ema : bool = True) -> torch.Tensor:
         """
@@ -309,6 +323,7 @@ class Generator(torch.nn.Module):
         super().__init__()
         self.image_size = image_size
         self.latent_dim = latent_dim
+        self.network_capacity = network_capacity
         self.max_features = max_features
 
         # Channel shrinking strategy per resolution taken from https://github.com/lucidrains/stylegan2-pytorch/blob/master/stylegan2_pytorch/stylegan2_pytorch.py
@@ -321,8 +336,24 @@ class Generator(torch.nn.Module):
         self.to_rgb_start = ToRgb(latent_dim, self.filters[0])
         self.use_tanh_last = use_tanh_last
         self.blocks = torch.nn.ModuleList([GeneratorBlock(self.filters[i - 1], self.filters[i], latent_dim) for i in range(1, len(self.filters))])
+        self.fir_filter = fir_filter
         self.upsample = Upsample(fir_filter = fir_filter)
 
+    def to_dict(self) -> dict:
+        d = {
+            "image_size": self.image_size,
+            "latent_dim": self.latent_dim,
+            "network_capacity": self.network_capacity,
+            "max_features": self.max_features,
+            "fir_filter": self.fir_filter,
+            "use_tanh_last": self.use_tanh_last
+        }
+
+        return d
+    
+    def from_dict(cls : Type["Generator"], d) -> Type["Generator"]:
+        return cls(d["image_size"], d["latent_dim"], d["network_capacity"], d["max_features"], d["fir_filter"], d["use_tanh_last"])
+    
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
@@ -499,6 +530,7 @@ class Discriminator(torch.nn.Module):
         # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/networks.py#L543
         # For now, working with RGB images only - 3 input chanels that is.
         self.from_rgb = torch.nn.Sequential(EqualizedConv2d(3, self.filters[0], 1), self.lrelu)
+        self.fir_filter = fir_filter
         self.disc_blocks = torch.nn.Sequential(*[
             DiscriminatorBlock(self.filters[i], self.filters[i + 1], fir_filter = fir_filter) for i in range(len(self.filters) - 1)
         ])
@@ -506,6 +538,24 @@ class Discriminator(torch.nn.Module):
         # TODO: Last resolution hardcoded to 4, perhaps make it dynamic somehow?
         self.last = DiscriminatorEpilogue(self.filters[-1], 4, use_mbstd = use_mbstd, mbstd_group_size = mbstd_group_size, mbstd_num_channels = mbstd_num_channels)
     
+    def to_dict(self) -> dict:
+        d = {
+            "input_res": self.input_res,
+            "in_channels": self.in_channels,
+            "network_capacity": self.network_capacity,
+            "max_features": self.max_features,
+            "use_mbstd": self.use_mbstd,
+            "mbstd_group_size": self.mbstd_group_size,
+            "mbstd_num_channels": self.mbstd_num_channels,
+            "fir_filter": self.fir_filter
+        }
+
+        return d
+    
+    @classmethod
+    def from_dict(cls : Type["Discriminator"], d) -> "Discriminator":
+        return cls(d["input_res"], d["in_channels"], d["network_capacity"], d["max_features"], d["use_mbstd"], d["mbstd_group_size"], d["mbstd_num_channels"], d["fir_filter"])
+
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 

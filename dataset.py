@@ -5,12 +5,12 @@ import torch
 import torchvision
 import torch
 import numpy as np
+import csv
 
 from PIL import Image
-from typing import Union
-from functools import partial
+from typing import Union, List
 
-def preprocess(img_size, source_dir : str, target_dir : str, center_crop_size : Union[float, None] = None, alpha : float = 1):
+def preprocess(img_size, source_dir : str, target_dir : str, allowed_labels : List[str], center_crop_size : Union[float, None] = None, alpha : float = 1):
     """
     CelebA (at least the original form) contains images of size 218x178. 218 = 2 x 89, 178 = 2 x 109, since layers inside
     generator and critic should double/shrink resolutions by factor of 2, this is inconvenient. Hence, we resize all images of CelebA to a 
@@ -31,12 +31,13 @@ def preprocess(img_size, source_dir : str, target_dir : str, center_crop_size : 
     labels = os.listdir(source_dir)
     labels = labels[:int(len(labels) * alpha)]
 
-    print(f"Transforming CelebA images to {img_size}:")
+    print(f"Processing and transfering CelebA images to {target_dir}. Expected number of images: {len(allowed_labels)}")
 
     for label in tqdm.tqdm(labels):
-        image = Image.open(os.path.join(source_dir, label))
-        image = compose(image)
-        image.save(os.path.join(target_dir, label))
+        if label in allowed_labels:
+            image = Image.open(os.path.join(source_dir, label))
+            image = compose(image)
+            image.save(os.path.join(target_dir, label))
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, path : str, alpha : float = 1):
@@ -71,4 +72,35 @@ def get_data_loader(dataset : Dataset, batch_size : int, pin_memory : bool = Tru
             yield sample
 
 if __name__ == "__main__":
-    preprocess(256, os.path.join("img_align_celeba", "img_align_celeba"), "celeba_256_v2", alpha = 0.01)
+    with open("./list_eval_partition.csv", "r", encoding = "utf-8") as f:
+        csv_file = csv.reader(f)
+        next(csv_file, None) # skip header
+        train_count, test_count, eval_count = 0, 0, 0
+        train_labels, test_labels, eval_labels = [], [], []
+
+        for line in csv_file:
+            set_id = int(line[1])
+
+            if set_id == 0:
+                train_count += 1
+                train_labels.append(line[0])
+
+            elif set_id == 1:
+                test_count += 1
+                test_labels.append(line[0])
+
+            else:
+                eval_count += 1
+                eval_labels.append(line[0])
+        
+        print(f"Train count: {train_count} Test count: {test_count} Eval count: {eval_count}")
+
+    '''
+    preprocess(128, os.path.join("img_align_celeba", "img_align_celeba"), "celeba_128_train", train_labels + test_labels)
+    preprocess(128, os.path.join("img_align_celeba", "img_align_celeba"), "celeba_128_eval", eval_labels)    
+
+    print(len(os.listdir("celeba_128_train")))
+    print(len(os.listdir("celeba_128_eval")))
+    print(len(train_labels + test_labels))
+    print(len(eval_labels))
+    '''
