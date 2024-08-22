@@ -11,6 +11,7 @@ from dataset import Dataset, get_data_loader
 from typing import Union, Tuple, Type, List
 from utils import generate_noise, generate_samples, new_style_mixing
 from PIL import Image
+from losses import FID
 
 # For now, supports only single GPU training. Also, no gradient accumulation, for now.
 class Trainer:
@@ -39,12 +40,13 @@ class Trainer:
         adam_beta1 : float = 0.0,
         adam_beta2 : float = 0.99,
         adam_eps : float = 1e-8,
-        save_every : int = 1000,
+        save_every : int = 1000,    # Create checkpoint every save_every generator steps. Also corresponds to evaluation strategy
         gen_ema_beta : float = 0.999,
         grad_accum_steps : int = 1,
         compute_generator_ema : bool = True,
         ema_steps_threshold : int = 1, # Compute Generator EMA starting from ema_steps_threshold,
-        log_every : int = 20 # Log loss information every log_every steps
+        log_every : int = 20, # Log loss information every log_every steps,
+        save_total_limit : Union[int, None] = None
     ):            
         self.root_path = root_path
         self.total_steps = total_steps
@@ -90,6 +92,8 @@ class Trainer:
         self.lazy_reg_steps_discriminator = lazy_reg_steps_discriminator
         self.d_steps = 0
         self.g_steps = 0
+        self.save_total_limit = save_total_limit
+        self.save_history = []
 
         self.MN = MN.to(device)
         self.G = G.to(device)
@@ -135,23 +139,34 @@ class Trainer:
             with open(os.path.join(checkpoint_path, ".metadata.json"), "r", encoding = "utf-8") as f:
                 local_metadata = json.load(f)
 
-            MN = MappingNetwork.from_dict(global_metadata["mapping_network_params"]).load_state_dict(torch.load(os.path.join(checkpoint_path, "MN.pt"), weights_only = True))
-            G = Generator.from_dict(global_metadata["generator_params"]).load_state_dict(torch.load(os.path.join(checkpoint_path, "G.pt"), weights_only = True))
-            D = Discriminator.from_dict(global_metadata["discriminator_params"]).to(global_metadata["device"]).load_state_dict(torch.load(os.path.join(checkpoint_path, "D.pt"), weights_only = True))
+            MN = MappingNetwork.from_dict(global_metadata["mapping_network_params"])
+            G = Generator.from_dict(global_metadata["generator_params"])
+            D = Discriminator.from_dict(global_metadata["discriminator_params"])
 
-            mne_path = os.path.join(checkpoint_path, "MNE.pt")
+            MN.load_state_dict(torch.load(os.path.join(checkpoint_path, "MN.pth"), weights_only = True))
+            G.load_state_dict(torch.load(os.path.join(checkpoint_path, "G.pth"), weights_only = True))
+            D.load_state_dict(torch.load(os.path.join(checkpoint_path, "D.pth"), weights_only = True))
+
+            mne_path = os.path.join(checkpoint_path, "MNE.pth")
             MNE, GE = None, None
 
             if os.path.exists(mne_path):
                 # TODO: device for Trainer is fixed, if it started training on CPU it would be "impossible" to continue training from GPU
                 # fix this some day.
-                MNE = MappingNetwork.from_dict(global_metadata["mapping_network_params"]).to(global_metadata["device"]).load_state_dict(torch.load(mne_path), weights_only = True)
-                GE = Generator.from_dict(global_metadata["generator_params"]).to(global_metadata["device"]).load_state_dict(torch.load(os.path.join(checkpoint_path, "GE.pt"), weights_only = True))
+                MNE = MappingNetwork.from_dict(global_metadata["mapping_network_params"]).to(global_metadata["device"])
+                GE = Generator.from_dict(global_metadata["generator_params"]).to(global_metadata["device"])
+                MNE.load_state_dict(torch.load(mne_path, weights_only = True))
+                GE.load_state_dict(torch.load(os.path.join(checkpoint_path, "GE.pth"), weights_only = True))
 
             kwargs_metadata = copy.deepcopy(global_metadata)
             kwargs_metadata.pop("total_steps")
             kwargs_metadata.pop("device")
+            kwargs_metadata.pop("target_resolution")
             kwargs_metadata.pop("batch_size")
+            kwargs_metadata.pop("mapping_network_params")
+            kwargs_metadata.pop("generator_params")
+            kwargs_metadata.pop("discriminator_params")
+
             res = Trainer(MN, G, D, 
                           root, 
                           global_metadata["total_steps"], 
@@ -167,11 +182,12 @@ class Trainer:
             res.d_gp_ia = local_metadata["d_gp_ia"]
             res.g_loss_ia = local_metadata["g_loss_ia"]
             res.g_plr_ia = local_metadata["g_plr_ia"]
+            res.save_total_limit = local_metadata["save_total_limit"]
+            res.save_history = local_metadata["save_history"]
 
-            res.MN = MN
-            res.G = G
-            res.D = D
-
+            res.optim_MN.load_state_dict(torch.load(os.path.join(checkpoint_path, "MN_optimizer.pth"), weights_only = True))
+            res.optim_G.load_state_dict(torch.load(os.path.join(checkpoint_path, "G_optimizer.pth"), weights_only = True))
+            res.optim_D.load_state_dict(torch.load(os.path.join(checkpoint_path, "D_optimizer.pth"), weights_only = True))
 
             if MNE is not None:
                 res.MNE = MNE
@@ -209,7 +225,6 @@ class Trainer:
     def __global_metadata_dict(self) -> dict:
         d = {
             "total_steps": self.total_steps,
-            "root_path": self.root_path,
             "device": self.device,
             "target_resolution": self.target_resolution,
             "batch_size": self.batch_size,
@@ -249,12 +264,34 @@ class Trainer:
             "d_loss_ia": float(self.d_loss_ia),
             "g_loss_ia": float(self.g_loss_ia),
             "d_gp_ia": float(self.d_gp_ia),
-            "g_plr_ia": float(self.g_plr_ia)
+            "g_plr_ia": float(self.g_plr_ia),
+            "save_total_limit": self.save_total_limit,
+            "save_history": self.save_history
         }
 
         return d
     
     def __create_checkpoint(self, check_name : str) -> None:
+        # TODO: When FID is implemented, also save model with best FID always, regardless of circumstances
+        # Remove oldest checkpoint in save_total_limit regime. save_total_limit is None, this is always False
+        if len(self.save_history) == self.save_total_limit:
+            target_steps = self.save_history[0]
+            
+            for label in os.listdir(self.root_path):
+                metadata = os.path.join(self.root_path, label, ".metadata.json")
+                try:
+                    with open(metadata, "r", encoding = "utf-8") as f:
+                        metadata = json.load(f)
+                    
+                    if metadata["g_steps"] == target_steps:
+                        shutil.rmtree(os.path.join(self.root_path, label))
+
+                except Exception as e:
+                    continue
+            
+            self.save_history.pop(0)
+
+        self.save_history.append(self.g_steps)
         path = os.path.join(self.root_path, check_name)
 
         if os.path.exists(path):
@@ -266,13 +303,16 @@ class Trainer:
         with open(os.path.join(path, ".metadata.json"), "w+", encoding = "utf-8") as f:
             json.dump(self.__local_metadata_dict(), f, indent = 4)
         
-        torch.save(self.MN.state_dict(), os.path.join(path, "MN.pt"))
-        torch.save(self.G.state_dict(), os.path.join(path, "G.pt"))
-        torch.save(self.D.state_dict(), os.path.join(path, "D.pt"))
-
+        torch.save(self.MN.state_dict(), os.path.join(path, "MN.pth"))
+        torch.save(self.G.state_dict(), os.path.join(path, "G.pth"))
+        torch.save(self.D.state_dict(), os.path.join(path, "D.pth"))
+        torch.save(self.optim_MN.state_dict(), os.path.join(path, "MN_optimizer.pth"))
+        torch.save(self.optim_G.state_dict(), os.path.join(path, "G_optimizer.pth"))
+        torch.save(self.optim_D.state_dict(), os.path.join(path, "D_optimizer.pth"))
+        
         if self.MNE is not None:
-            torch.save(self.MNE.state_dict(), os.path.join(path, "MNE.pt"))
-            torch.save(self.GE.state_dict(), os.path.join(path, "GE.pt"))
+            torch.save(self.MNE.state_dict(), os.path.join(path, "MNE.pth"))
+            torch.save(self.GE.state_dict(), os.path.join(path, "GE.pth"))
         
     def __discriminator_step(self, train_loader : torch.utils.data.DataLoader) -> Tuple[float, float]:
         self.optim_D.zero_grad()
@@ -465,11 +505,8 @@ if __name__ == "__main__":
     print(f"Total number of steps: {steps}")
     print(f"Images to train on: {target_num_images}")
     print(f"Number of images per step: {batch_size * grad_accum}")
-    
-    steps = 1000
 
-    '''
-    t = Trainer(mn, g, d, "first_model", 10, DEVICE, 128, batch_size, 
+    t = Trainer(mn, g, d, "stylegan2_celeba_128", steps, DEVICE, target_res, batch_size, 
                 loss_type = "vanilla", 
                 save_every = 1, 
                 learning_rate = 0.002, 
@@ -477,8 +514,7 @@ if __name__ == "__main__":
                 style_mixing_prob = 0.9, 
                 log_every = 10, 
                 gen_ema_beta = 0.999, 
-                ema_steps_threshold = 1)
-    '''
-
-    t = Trainer.from_trained("first_model", load_latest = True)
+                ema_steps_threshold = 3000,
+                save_total_limit = 1)
+    
     t.train(train_dl, eval_dl, num_generated_rows = 4)

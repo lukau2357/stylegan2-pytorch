@@ -351,6 +351,7 @@ class Generator(torch.nn.Module):
 
         return d
     
+    @classmethod
     def from_dict(cls : Type["Generator"], d) -> Type["Generator"]:
         return cls(d["image_size"], d["latent_dim"], d["network_capacity"], d["max_features"], d["fir_filter"], d["use_tanh_last"])
     
