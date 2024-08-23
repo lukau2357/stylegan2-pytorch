@@ -5,6 +5,8 @@ import losses
 import json
 import tqdm
 import shutil
+import argparse
+import csv
 
 from model import Generator, Discriminator, MappingNetwork
 from dataset import Dataset, get_data_loader
@@ -12,24 +14,23 @@ from typing import Union, Tuple, Type, List
 from utils import generate_noise, generate_samples, new_style_mixing
 from PIL import Image
 from losses import FID
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel
 
 # For now, supports only single GPU training. Also, no gradient accumulation, for now.
 class Trainer:
     def __init__(self,
-        MN : Union[MappingNetwork, None], # Mapping network component of generator, None if running from pretrained
-        G : Union[Generator, None], # Synthesis network component of generator, None if running from pretrained
-        D: Union[Discriminator, None], # Discriminator, None if running from pretrained
+        MN : Union[MappingNetwork, DistributedDataParallel], # Mapping network component of generator, None if running from pretrained
+        G : Union[Generator, DistributedDataParallel], # Synthesis network component of generator, None if running from pretrained
+        D: Union[Discriminator, DistributedDataParallel], # Discriminator, None if running from pretrained
         root_path : str,
-        total_steps : int,  # Number of training steps (for generator),
-        device : str,
         target_resolution : int,
-        batch_size : int,
         loss_type : str = "vanilla",    # Use vanilla GAN loss or WGAN loss
         use_gp : bool = True,    # Use gradient penalty
         use_plr : bool = True,   # Use path length regularization
         style_mixing_prob : float = 0.9,
-        style_mixing_prob_inference : List[float] = [0.9],
-        truncation_psi_inference : List[float] = [0.7],
+        style_mixing_prob_inference : List[float] = [0],
+        truncation_psi_inference : List[float] = [0.2],
         gp_weight : float = 10.0,    # Weight for gradient penalty
         pl_weight : float = 2.0,     # Weight for path length regularization
         pl_beta : float = 0.99,      # Exponential moving average coefficient to use for path length regularization,
@@ -44,15 +45,10 @@ class Trainer:
         gen_ema_beta : float = 0.999,
         grad_accum_steps : int = 1,
         compute_generator_ema : bool = True,
-        ema_steps_threshold : int = 1, # Compute Generator EMA starting from ema_steps_threshold,
-        log_every : int = 20, # Log loss information every log_every steps,
-        save_total_limit : Union[int, None] = None
+        ema_steps_threshold : int = 1 # Compute Generator EMA starting from ema_steps_threshold,
     ):            
         self.root_path = root_path
-        self.total_steps = total_steps
-        self.device = device
         self.target_resolution = target_resolution
-        self.batch_size = batch_size
         
         assert loss_type in ["vanilla", "wgan"]
         self.loss_type = loss_type
@@ -84,7 +80,6 @@ class Trainer:
         self.gen_ema_beta = gen_ema_beta
         self.compute_generator_ema = compute_generator_ema
         self.ema_steps_threshold = ema_steps_threshold
-        self.log_every = log_every
         self.grad_accum_steps = grad_accum_steps
 
         self.disc_optim_steps = disc_optim_steps
@@ -92,13 +87,11 @@ class Trainer:
         self.lazy_reg_steps_discriminator = lazy_reg_steps_discriminator
         self.d_steps = 0
         self.g_steps = 0
-        self.save_total_limit = save_total_limit
-        self.save_history = []
 
-        self.MN = MN.to(device)
-        self.G = G.to(device)
-        self.D = D.to(device)
-
+        self.MN = MN
+        self.G = G
+        self.D = D
+        
         self.MNE = None
         self.GE = None
             
@@ -106,11 +99,6 @@ class Trainer:
         d_scale = (self.lazy_reg_steps_discriminator) / (self.lazy_reg_steps_discriminator + 1)
 
         # Incremental averages of discriminator loss, discriminator gradient penalty, generator loss and generator path length regularization, respectivley
-        self.d_loss_ia = 0
-        self.d_gp_ia = 0
-        self.g_loss_ia = 0
-        self.g_plr_ia = 0
-
         self.learning_rate = learning_rate
         self.adam_beta1 = adam_beta1
         self.adam_beta2 = adam_beta2
@@ -124,12 +112,39 @@ class Trainer:
 
         if not os.path.exists(self.root_path):
             os.mkdir(self.root_path)
-        
+
+        # Seperate directory for storing samples obtained during training
+        if not os.path.exists(os.path.join(self.root_path, "samples")):
+            os.mkdir(os.path.join(self.root_path, "samples"))
+
         with open(os.path.join(self.root_path, ".metadata.json"), "w+", encoding = "utf-8") as f:
             json.dump(self.__global_metadata_dict(), f, indent = 4)
+     
+        self.__create_csv("d_adversarial_loss.csv", "adversarial_loss")
+        self.__create_csv("g_adversarial_loss.csv", "adversarial_loss")
 
+        if self.use_gp:
+            self.__create_csv("d_gp.csv", "gradient_penalty")
+        
+        if self.use_plr:
+            self.__create_csv("g_plr.csv", "path_length_regularization")
+    
+    def __create_csv(self, name, header):
+        if not os.path.exists(os.path.join(self.root_path, name)):
+            with open(os.path.join(self.root_path, name), "w+", encoding = "utf-8") as f:
+                writer = csv.writer(f, lineterminator = "\n")
+                writer.writerow([header])
+    
+    def __write_csv(self, name, data):
+        with open(os.path.join(self.root_path, name), "a+", encoding = "utf-8") as f:
+            writer = csv.writer(f, lineterminator = "\n")
+            writer.writerow([data])
+    
+    def __get_raw_model(self, model):
+        return model if not isinstance(model, DistributedDataParallel) else model.module
+    
     @classmethod
-    def from_trained(cls : Type["Trainer"], root_path : str, checkpoint_path : Union[str, None] = None, load_latest: Union[bool, None] = None, load_best_fid : Union[bool, None] = None):
+    def from_trained(cls : Type["Trainer"], root_path : str, local_rank : int, device : str, is_ddp : bool, is_master_process : bool):
         def from_checkpoint(root, checkpoint) -> Type["Trainer"]:
             checkpoint_path = os.path.join(root, checkpoint)
 
@@ -139,51 +154,42 @@ class Trainer:
             with open(os.path.join(checkpoint_path, ".metadata.json"), "r", encoding = "utf-8") as f:
                 local_metadata = json.load(f)
 
-            MN = MappingNetwork.from_dict(global_metadata["mapping_network_params"])
-            G = Generator.from_dict(global_metadata["generator_params"])
-            D = Discriminator.from_dict(global_metadata["discriminator_params"])
+            MN = MappingNetwork.from_dict(global_metadata["mapping_network_params"]).to(device)
+            G = Generator.from_dict(global_metadata["generator_params"]).to(device)
+            D = Discriminator.from_dict(global_metadata["discriminator_params"]).to(device)
 
             MN.load_state_dict(torch.load(os.path.join(checkpoint_path, "MN.pth"), weights_only = True))
             G.load_state_dict(torch.load(os.path.join(checkpoint_path, "G.pth"), weights_only = True))
             D.load_state_dict(torch.load(os.path.join(checkpoint_path, "D.pth"), weights_only = True))
 
+            if is_ddp:
+                MN = DistributedDataParallel(MN, device_ids = [local_rank])
+                G = DistributedDataParallel(G, device_ids = [local_rank])
+                D = DistributedDataParallel(D, device_ids = [local_rank])
+
             mne_path = os.path.join(checkpoint_path, "MNE.pth")
             MNE, GE = None, None
 
-            if os.path.exists(mne_path):
-                # TODO: device for Trainer is fixed, if it started training on CPU it would be "impossible" to continue training from GPU
-                # fix this some day.
-                MNE = MappingNetwork.from_dict(global_metadata["mapping_network_params"]).to(global_metadata["device"])
-                GE = Generator.from_dict(global_metadata["generator_params"]).to(global_metadata["device"])
+            if os.path.exists(mne_path) and is_master_process:
+                MNE = MappingNetwork.from_dict(global_metadata["mapping_network_params"]).to(device)
+                GE = Generator.from_dict(global_metadata["generator_params"]).to(device)
                 MNE.load_state_dict(torch.load(mne_path, weights_only = True))
                 GE.load_state_dict(torch.load(os.path.join(checkpoint_path, "GE.pth"), weights_only = True))
 
             kwargs_metadata = copy.deepcopy(global_metadata)
-            kwargs_metadata.pop("total_steps")
-            kwargs_metadata.pop("device")
             kwargs_metadata.pop("target_resolution")
-            kwargs_metadata.pop("batch_size")
             kwargs_metadata.pop("mapping_network_params")
             kwargs_metadata.pop("generator_params")
             kwargs_metadata.pop("discriminator_params")
 
             res = Trainer(MN, G, D, 
-                          root, 
-                          global_metadata["total_steps"], 
-                          global_metadata["device"], 
+                          root,
                           global_metadata["target_resolution"],
-                          global_metadata["batch_size"],
                           **kwargs_metadata
                           )
             
             res.d_steps = local_metadata["d_steps"]
             res.g_steps = local_metadata["g_steps"]
-            res.d_loss_ia = local_metadata["d_loss_ia"]
-            res.d_gp_ia = local_metadata["d_gp_ia"]
-            res.g_loss_ia = local_metadata["g_loss_ia"]
-            res.g_plr_ia = local_metadata["g_plr_ia"]
-            res.save_total_limit = local_metadata["save_total_limit"]
-            res.save_history = local_metadata["save_history"]
 
             res.optim_MN.load_state_dict(torch.load(os.path.join(checkpoint_path, "MN_optimizer.pth"), weights_only = True))
             res.optim_G.load_state_dict(torch.load(os.path.join(checkpoint_path, "G_optimizer.pth"), weights_only = True))
@@ -195,39 +201,11 @@ class Trainer:
 
             return res
         
-        # 1. Load from specified checkpoint
-        if checkpoint_path is not None:
-            return from_checkpoint(root_path, checkpoint_path)
-
-        # 2. Load latest model - with greates number of generator steps
-        elif load_latest:
-            max_steps, check_label = -1, None
-            for label in os.listdir(root_path):
-                try:
-                    with open(os.path.join(root_path, label, ".metadata.json"), "r", encoding = "utf-8") as f:
-                        local_metadata = json.load(f)
-                        if local_metadata["g_steps"] > max_steps:
-                            max_steps = local_metadata["g_steps"]
-                            check_label = label
-
-                except Exception:
-                    continue
-            
-            assert check_label is not None, f"No model checkpoint was foudn in {root_path}"
-            return from_checkpoint(root_path, check_label)
-
-        # 3. Load model with best FID on eval - TODO
-        elif load_best_fid:
-            pass
-            
-        raise Exception("At least one of checkpoint_path, load_latest, load_best_fid has to be given when loading from trained.")
-    
+        return from_checkpoint(root_path, "last_checkpoint")
+                
     def __global_metadata_dict(self) -> dict:
         d = {
-            "total_steps": self.total_steps,
-            "device": self.device,
             "target_resolution": self.target_resolution,
-            "batch_size": self.batch_size,
             "loss_type": self.loss_type,
             "use_gp": self.use_gp,
             "use_plr": self.use_plr,
@@ -249,10 +227,9 @@ class Trainer:
             "grad_accum_steps": self.grad_accum_steps,
             "compute_generator_ema": self.compute_generator_ema,
             "ema_steps_threshold": self.ema_steps_threshold,
-            "log_every": self.log_every,
-            "mapping_network_params": self.MN.to_dict(),
-            "generator_params": self.G.to_dict(),
-            "discriminator_params": self.D.to_dict()
+            "mapping_network_params": self.__get_raw_model(self.MN).to_dict(),
+            "generator_params": self.__get_raw_model(self.G).to_dict(),
+            "discriminator_params": self.__get_raw_model(self.D).to_dict()
         }
 
         return d
@@ -260,38 +237,12 @@ class Trainer:
     def __local_metadata_dict(self) -> dict:
         d = {
             "d_steps": self.d_steps,
-            "g_steps": self.g_steps,
-            "d_loss_ia": float(self.d_loss_ia),
-            "g_loss_ia": float(self.g_loss_ia),
-            "d_gp_ia": float(self.d_gp_ia),
-            "g_plr_ia": float(self.g_plr_ia),
-            "save_total_limit": self.save_total_limit,
-            "save_history": self.save_history
+            "g_steps": self.g_steps
         }
 
         return d
     
     def __create_checkpoint(self, check_name : str) -> None:
-        # TODO: When FID is implemented, also save model with best FID always, regardless of circumstances
-        # Remove oldest checkpoint in save_total_limit regime. save_total_limit is None, this is always False
-        if len(self.save_history) == self.save_total_limit:
-            target_steps = self.save_history[0]
-            
-            for label in os.listdir(self.root_path):
-                metadata = os.path.join(self.root_path, label, ".metadata.json")
-                try:
-                    with open(metadata, "r", encoding = "utf-8") as f:
-                        metadata = json.load(f)
-                    
-                    if metadata["g_steps"] == target_steps:
-                        shutil.rmtree(os.path.join(self.root_path, label))
-
-                except Exception as e:
-                    continue
-            
-            self.save_history.pop(0)
-
-        self.save_history.append(self.g_steps)
         path = os.path.join(self.root_path, check_name)
 
         if os.path.exists(path):
@@ -314,21 +265,21 @@ class Trainer:
             torch.save(self.MNE.state_dict(), os.path.join(path, "MNE.pth"))
             torch.save(self.GE.state_dict(), os.path.join(path, "GE.pth"))
         
-    def __discriminator_step(self, train_loader : torch.utils.data.DataLoader) -> Tuple[float, float]:
+    def __discriminator_step(self, world_size : int, batch_size : int, train_loader : torch.utils.data.DataLoader, device : str):
         self.optim_D.zero_grad()
-        should_reg = self.lazy_reg_steps_discriminator > 0 and (self.d_steps + 1) % self.lazy_reg_steps_discriminator == 0
+        should_reg = self.lazy_reg_steps_discriminator > 0 and (self.d_steps + 1) % self.lazy_reg_steps_discriminator == 0 and self.use_gp
 
         d_loss, gp_loss = 0, 0
 
-        for _ in range(self.grad_accum_steps):
-            real_samples = next(train_loader).to(self.device)
+        for i in range(self.grad_accum_steps):
+            real_samples = next(train_loader).to(device)
             # Potential gradient penalty computation
             real_samples.requires_grad_(should_reg)
 
-            real_pred = self.D(real_samples)
-            ws, _, _ = new_style_mixing(self.MN, self.batch_size, self.device, self.style_mixing_prob, self.G.num_layers * 2)
-            fake_samples = self.G(ws, generate_noise(self.target_resolution, self.batch_size, self.device)).detach() # Detach generator from computational graph
-            fake_pred = self.D(fake_samples)
+            real_pred = self.__get_raw_model(self.D)(real_samples)
+            ws, _, _ = new_style_mixing(self.__get_raw_model(self.MN), batch_size, device, self.style_mixing_prob, self.__get_raw_model(self.G).num_layers * 2)
+            fake_samples = self.__get_raw_model(self.G)(ws, generate_noise(self.target_resolution, batch_size, device)).detach() # Detach generator from computational graph
+            fake_pred = self.__get_raw_model(self.D)(fake_samples)
 
             current_d_loss = self.D_loss(real_pred, fake_pred) / self.grad_accum_steps
             current_gp_loss = 0
@@ -340,17 +291,24 @@ class Trainer:
                 # Quote from StyleGAN2 paper: "We also multiply the regularization term by k to balance the overall magnitude of its gradients"          
                 if self.loss_type == "vanilla":
                     current_gp_loss = (self.D_gp(real_samples, real_pred) / self.grad_accum_steps) * self.lazy_reg_steps_discriminator
-                    gp_loss += current_gp_loss
 
                 # For WGAN loss we use GP penalty, norm deviations from 1 and fake/real interpolation
                 else:
-                    ws, _, _ = new_style_mixing(self.MN, self.batch_size, self.device, self.style_mixing_prob, self.G.num_layers * 2)
-                    fake_samples = self.G(ws, generate_noise(self.target_resolution, self.batch_size, self.device))
+                    ws, _, _ = new_style_mixing(self.__get_raw_model(self.MN), batch_size, device, self.style_mixing_prob, self.__get_raw_model(self.G).num_layers * 2)
+                    fake_samples = self.__get_raw_model(self.G)(ws, generate_noise(self.target_resolution, batch_size, device))
                     current_gp_loss = (self.D_gp(real_samples, real_pred = None, fake_samples = fake_samples, critic = self.D) / self.grad_accum_steps) * self.lazy_reg_steps_discriminator
-                    gp_loss += current_gp_loss
+                
+                gp_loss += current_gp_loss
             
-            current_loss = current_d_loss + current_gp_loss
-            current_loss.backward()
+            # Account for world_size when doing backward
+            current_loss = (current_d_loss + current_gp_loss) / world_size
+            if i < self.grad_accum_steps - 1 and isinstance(self.D, DistributedDataParallel):
+                with self.D.no_sync():
+                    current_loss.backward()
+            
+            # Synchronize gradients accross GPUs at the very last step of gradient accumulation!
+            else:
+                current_loss.backward()
 
         self.optim_D.step()
 
@@ -358,34 +316,40 @@ class Trainer:
         return d_loss, gp_loss
 
     # Make private once initial tests are done
-    def __generator_step(self) -> Tuple[float, float]:
+    def __generator_step(self, world_size : int, batch_size : int, device : str):
         self.optim_MN.zero_grad()
         self.optim_G.zero_grad()
 
-        should_reg = self.lazy_reg_steps_generator > 0 and (self.g_steps + 1) % self.lazy_reg_steps_generator == 0
+        should_reg = self.lazy_reg_steps_generator > 0 and (self.g_steps + 1) % self.lazy_reg_steps_generator == 0 and self.use_plr
 
         g_loss, plr_loss = 0, 0
 
-        for _ in range(self.grad_accum_steps):
-            ws, _, _ = new_style_mixing(self.MN, self.batch_size, self.device, self.style_mixing_prob, self.G.num_layers * 2)
-            fake_samples = self.G(ws, generate_noise(self.target_resolution, self.batch_size, self.device))
-            fake_pred = self.D(fake_samples)
+        for i in range(self.grad_accum_steps):
+            ws, _, _ = new_style_mixing(self.__get_raw_model(self.MN), batch_size, device, self.style_mixing_prob, self.__get_raw_model(self.G).num_layers * 2)
+            fake_samples = self.__get_raw_model(self.G)(ws, generate_noise(self.target_resolution, batch_size, device))
+            fake_pred = self.__get_raw_model(self.D)(fake_samples)
 
             current_g_loss = self.G_loss(fake_pred) / self.grad_accum_steps
             current_plr_loss = 0
 
             g_loss += current_g_loss
 
-            # Apparently path length regularization uses new fake samples from generator?
+            # Apparently path length regularization uses new fake samples from generator
             # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/loss.py#L77
             if should_reg:
-                ws, _, _ = new_style_mixing(self.MN, self.batch_size, self.device, self.style_mixing_prob, self.G.num_layers * 2)
-                fake_samples = self.G(ws, generate_noise(self.target_resolution, self.batch_size, self.device))
+                ws, _, _ = new_style_mixing(self.__get_raw_model(self.MN), batch_size, device, self.style_mixing_prob, self.__get_raw_model(self.G).num_layers * 2)
+                fake_samples = self.__get_raw_model(self.G)(ws, generate_noise(self.target_resolution, batch_size, device))
                 current_plr_loss = (self.G_plr(ws, fake_samples)  / self.grad_accum_steps) * self.lazy_reg_steps_generator
                 plr_loss += current_plr_loss
             
-            current_loss = current_g_loss + current_plr_loss
-            current_loss.backward()
+            current_loss = (current_g_loss + current_plr_loss) / world_size
+            if i < self.grad_accum_steps - 1 and isinstance(self.G, DistributedDataParallel):
+                with self.G.no_sync():
+                    with self.MN.no_sync():
+                        current_loss.backward()
+
+            else:
+                current_loss.backward()
 
         self.optim_MN.step()
         self.optim_G.step()
@@ -426,37 +390,63 @@ class Trainer:
                 else:
                     ema_param.copy_(param)
 
-    def __model_step(self, pbar : tqdm.tqdm, train_loader : torch.utils.data.DataLoader):
+    def __model_step(self, world_size : int, batch_size : int, pbar : tqdm.tqdm, train_loader : torch.utils.data.DataLoader, device : str, is_local_master : bool):
+        disc_losses, disc_regs = [], []
+
         for _ in range(self.disc_optim_steps):
-            l, r = self.__discriminator_step(train_loader)
+            l, r = self.__discriminator_step(world_size, batch_size, train_loader, device)
+            disc_losses.append(float(l))
             
-            self.d_loss_ia = l if self.d_steps == 1 else ((self.d_steps - 1) / self.d_steps) * self.d_loss_ia + l / self.d_steps
-
+            # If previous iteration was for regularization
             if self.d_steps % self.lazy_reg_steps_discriminator == 0:
-                effective_iter = self.d_steps / self.lazy_reg_steps_discriminator
-                self.d_gp_ia = ((effective_iter - 1) / effective_iter) * self.d_gp_ia + r / effective_iter
+                disc_regs.append(float(r))
+            
+        l, r = self.__generator_step(world_size, batch_size, device)
+
+        if is_local_master:
+            pbar.set_postfix({"Local G loss": float(l), 
+                            "Local G PLR": float(r), 
+                            "Local D loss average": sum(disc_losses) / len(disc_losses), 
+                            "Local D GP average": sum(disc_regs) / len(disc_regs) if len(disc_regs) > 0 else 0})
+
+            # Local masters should write loss data to non-shared filesystems so that it can be accumulated
+            for d_loss in disc_losses:
+                self.__write_csv("d_adversarial_loss.csv", d_loss)
+            
+            for d_reg in disc_regs:
+                self.__write_csv("d_gp.csv", d_reg)
+            
+            self.__write_csv("g_adversarial_loss.csv", float(l))
+
+            if self.g_steps % self.lazy_reg_steps_generator == 0:
+                self.__write_csv("g_plr.csv", float(r))
+            
+    def train(self, 
+              total_steps : int, 
+              train_loader : torch.utils.data.DataLoader, 
+              val_loader : torch.utils.data.DataLoader,
+              is_master : bool,
+              is_local_master : bool,
+              device : str,
+              batch_size : int, 
+              world_size : int, 
+              num_images_inference : int = 16, 
+              num_generated_rows : int = 1):
         
-        l, r = self.__generator_step()
+        pbar = None
+        if is_local_master:
+            pbar = tqdm.tqdm(total = total_steps, initial = self.g_steps, position = 0, leave = True)
 
-        self.g_loss_ia = l if self.g_steps == 1 else ((self.g_steps - 1) / self.g_steps) * self.g_loss_ia + l / self.g_steps
+        for _ in range(self.g_steps, total_steps):
+            self.__model_step(world_size, batch_size, pbar, train_loader, device, is_local_master)
 
-        if self.g_steps % self.lazy_reg_steps_generator == 0:
-            effective_iter = self.g_steps / self.lazy_reg_steps_generator
-            self.g_plr_ia = ((effective_iter - 1) / effective_iter) * self.g_plr_ia + r / effective_iter
+            if not is_master:
+                continue
 
-        if self.g_steps % self.log_every == 0:
-            pbar.write(f"Steps: {self.g_steps}\nImages generated by generator: {self.g_steps * self.batch_size * self.grad_accum_steps / 1e6:.6f}M\nAverage D loss: {self.d_loss_ia:.4f}\nAverage D gradient penalty: {self.d_gp_ia:.4f}\nAverage G loss: {self.g_loss_ia:.4f}\nAverage G path length regularization: {self.g_plr_ia}\n")
-
-    def train(self, train_loader : torch.utils.data.DataLoader, val_loader : torch.utils.data.DataLoader, num_images_inference : int = 16, num_generated_rows : int = 1):
-        pbar = tqdm.tqdm(range(self.g_steps, self.total_steps), position = 0, leave = True)
-
-        for _ in range(self.g_steps, self.total_steps):
-            self.__model_step(pbar, train_loader)
             self.__ema_generator_step()
             
-            if self.g_steps % self.save_every == 0:
-                check_name = f"checkpoint_{self.g_steps}"
-                self.__create_checkpoint(check_name)
+            if self.g_steps % self.save_every == 0 or self.g_steps == total_steps:
+                self.__create_checkpoint("last_checkpoint")
 
                 # TODO: Sampling only for now, incorporate FID computation
                 # Also save which combination of psi and style mixing probability gave best FID score
@@ -465,56 +455,172 @@ class Trainer:
                         for j, smp in enumerate(self.style_mixing_prob_inference):
                             # Possible that EMA models don't exist if current g_steps < ema_steps_threshold 
                             if self.MNE is not None:
-                                ema_samples = generate_samples(self.GE, self.MNE, self.target_resolution, self.device, num_images_inference, 2 * self.G.num_layers,
+                                ema_samples = generate_samples(self.GE, self.MNE, self.target_resolution, device, num_images_inference, self.__get_raw_model(self.G).num_layers * 2,
                                                                 style_mixing_prob = smp,
                                                                 truncation_psi = psi,
                                                                 num_generated_rows = num_generated_rows,
                                                                 update_w_ema = False)
                                     
-                                Image.fromarray(ema_samples, mode = "RGB").save(os.path.join(self.root_path, check_name, f"ema_samples_{i}{j}.jpg"))
+                                Image.fromarray(ema_samples, mode = "RGB").save(os.path.join(self.root_path, "samples", f"ema_samples_{self.g_steps}_{i}{j}.jpg"))
 
-                            current_samples = generate_samples(self.G, self.MN, self.target_resolution, self.device, num_images_inference, 2 * self.G.num_layers,
+                            current_samples = generate_samples(self.__get_raw_model(self.G), self.__get_raw_model(self.MN), self.target_resolution, device, num_images_inference, self.__get_raw_model(self.G).num_layers * 2,
                                                             style_mixing_prob = smp,
                                                             truncation_psi = psi,
                                                             num_generated_rows = num_generated_rows,
                                                             update_w_ema = False)
                                 
-                            Image.fromarray(current_samples, mode = "RGB").save(os.path.join(self.root_path, check_name, f"current_samples_{i}{j}.jpg"))
+                            Image.fromarray(current_samples, mode = "RGB").save(os.path.join(self.root_path, "samples", f"current_samples_{self.g_steps}_{i}{j}.jpg"))
             pbar.update(1)
         pbar.close()
 
+def parse_args():
+    parser = argparse.ArgumentParser(formatter_class = argparse.ArgumentDefaultsHelpFormatter)
+    # Mandatory
+    parser.add_argument("--path_train", type = str, help = "[REQUIRED] Path to training set images", required = True)
+    parser.add_argument("--path_eval", type = str, help = "[REQUIRED] Path to evaluation set images", required = True)
+    parser.add_argument("--target_res", type = int, default = 128, help = "[REQUIRED] Width and height of images, should be a power of 2 consistent with provided datasets, for now", required = True)
+    parser.add_argument("--model_dir", type = str, help = "Directory where model checkpoints and infered samples should be saved", required = True)
+
+    # Optional
+    parser.add_argument("--latent_dim", type = int, default = 512, help = "Dimensionality of style vectors")
+    parser.add_argument("--batch_size", type = int, default = 32, help = "Per device batch size")
+    parser.add_argument("--grad_accum", type = int, default = 4, help = "Gradient accumulations steps to perform on each device before summing gradients")
+    parser.add_argument("--mn_depth", type = int, default = 8, help = "Depth of the mapping network")
+    parser.add_argument("--training_steps", type = int, default = 1000, help = "Number of training steps")
+    parser.add_argument("--target_num_images", type = int, help = "Number of images to train the model on. Will override training-steps, if given")
+    parser.add_argument("--loss_type", type = str, default = "vanilla", help = "GAN loss type to be used for the model. Can be vanilla or wgan")
+    parser.add_argument("--save_every", type = int, default = 1000, help = "Creates a model checkpoint every save-every steps. Also period of inference")
+    parser.add_argument("--learning_rate", type = float, default = 2e-3, help = "Learning rate for optimizers")
+    parser.add_argument("--mlp_lr_mul", type = float, default = 0.01, help = "Reduces learning rate of mapping network by a factor of mlp-lr-mul")
+    parser.add_argument("--style_mixing_prob", type = float, default = 0.9, help = "Style mixing probability to use during training")
+    parser.add_argument("--gen_ema_beta", type = float, default = 0.999, help = "Decay coefficient for EMA of mapping network and generator weights")
+    parser.add_argument("--ema_steps_threshold", type = int, default = 3000, help = "Compute EMA of mapping network and generator weights only after ema-steps-threshold training steps")
+    # TODO: Add formula for how network-capacity affects number of filters
+    parser.add_argument("--network_capacity", type = int, default = 8, help = "Multiplicative factor for number of filters in generator and discrimonator")
+    parser.add_argument("--gen_use_tanh_last", type = bool, default = False, help = "Use tanh in the last layer of generator to keep images in [-1, 1]. StyleGAN2 paper does not use this in the last layer")
+    parser.add_argument("--disc_use_mbstd", type = bool, default = True, help = "Use minibatch-std in last layer of discriminator")
+    parser.add_argument("--style_mixing_probs_inference", nargs = "+", default = [0.0], help = "Different style mixing probabilities to try during inference, pass as a space-seperated list of floats")
+    parser.add_argument("--truncation_psis_inference", nargs = "+", default = [0.0], help = "Different psi-s for truncation trick to use during inference, pass as a space-seperated list of floats")
+    parser.add_argument("--fir_filter_sampling", nargs = "+", default = [1, 3, 3, 1], help = "Unnormalized FIR filter to use in upsampling/downsampling layers")
+    parser.add_argument("--w_ema_beta", type = float, default = 0.995, help = "EMA coefficient to use when estimating mean style vector in mapping network during training")
+    parser.add_argument("--max_filters", type = int, default = 512, help = "Maximum number of filters to use in convolutional layers of generator and discriminator")
+    parser.add_argument("--mbstd_group_size", type = int, default = 4, help = "Minibatch standard deviation group size for discriminator, --batch-size should be divisible by this")
+    parser.add_argument("--mbstd_num_channels", type = int, default = 1, help = "Minibatch standard deviation number of channels for discriminator, should divide number of channels at the output of discriminator, before applying minibatchstd and flatten")
+    # TODO: Pass this to both generator and discriminator
+    parser.add_argument("--images_in_channels", type = int, default = 3, help = "Number of channels for images to be considered by the model")
+    parser.add_argument("--ddp_backend", type = str, default = "nccl", help = "DDP backend to use. If training on CPU, you should use gloo. Supported backends, and DDP documentation is available at: https://pytorch.org/docs/stable/distributed.html. If running from Windows, you might want to run with gloo, as nccl is not supported (at least at the time of writhing these scripts)")
+    parser.add_argument("--from_checkpoint", type = bool, nargs = "?", default = False, const = True, help = "Continue training from latest checkpoint in model_dir")
+    parser.add_argument("--num_images_inference", type = int, default = 16, help = "Number of images to generate for inference")
+    parser.add_argument("--num_rows_inference", type = int, default = 4, help = "Number of rows to present generated images during inference. Should divide num_images_inference")
+
+    args = parser.parse_args()
+    return args
+
+"""
+Remove device attribute from Trainer. Pass current device to Trainer.train(), from there pass it to __generator_step, __discriminator_step, __ema_step
+__ema_step should be done only from the master process - rank = 0 - master_process flag to trainer as well
+"""
+
 if __name__ == "__main__":
-    DEVICE = "cuda"
-    latent_dim = 512
-    target_res = 128
+    args = parse_args()
+    print(args)
 
-    mn = MappingNetwork(latent_dim, 8, lr_mul = 0.01).to(DEVICE)
-    g = Generator(target_res, latent_dim).to(DEVICE)
-    d = Discriminator(target_res, 3).to(DEVICE)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ddp = int(os.environ.get('RANK', -1)) != -1
 
-    train_dataset = Dataset("celeba_128_train")
-    eval_dataset = Dataset("celeba_128_eval")
-
-    batch_size = 32
-    grad_accum = 4
-    train_dl = get_data_loader(train_dataset, batch_size)
-    eval_dl = get_data_loader(eval_dataset, batch_size)
-
-    target_num_images = 2e6
-    steps = int(target_num_images / (batch_size * grad_accum))
-    print(f"Total number of steps: {steps}")
-    print(f"Images to train on: {target_num_images}")
-    print(f"Number of images per step: {batch_size * grad_accum}")
-
-    t = Trainer(mn, g, d, "stylegan2_celeba_128", steps, DEVICE, target_res, batch_size, 
-                loss_type = "vanilla", 
-                save_every = 1, 
-                learning_rate = 0.002, 
-                grad_accum_steps = grad_accum, 
-                style_mixing_prob = 0.9, 
-                log_every = 10, 
-                gen_ema_beta = 0.999, 
-                ema_steps_threshold = 3000,
-                save_total_limit = 1)
+    if ddp:
+        backend = args.ddp_backend
+        init_process_group(backend = backend)
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        # device = f'cuda:{ddp_local_rank}' # TODO: Uncomment and remove bottom line when local testing is done
+        device = "cuda:0"
+        torch.cuda.set_device(device)
+        is_master = ddp_rank == 0
+        is_local_master = ddp_local_rank == 0
+        seed_offset = ddp_rank # each process gets a different seed
+        
+        if is_master:
+            print("Is DDP")
+            print(f"DDP world size: {ddp_world_size}")
+        
+    else:
+        # if not ddp, we are running on a single gpu, and one process
+        is_master = True
+        is_local_master = True
+        seed_offset = 0
+        ddp_world_size = 1
+        ddp_rank = 0
+        ddp_local_rank = 0
+        
+        print("Not DDP")
     
-    t.train(train_dl, eval_dl, num_generated_rows = 4)
+    if args.from_checkpoint:
+        t = Trainer.from_trained(args.model_dir, ddp_local_rank, device, ddp, is_master)
+
+        training_steps = args.training_steps
+        if args.target_num_images is not None:
+            training_steps = int(args.target_num_images / (ddp_world_size * args.batch_size * args.grad_accum))
+
+        train_dataset = Dataset(args.path_train)
+        eval_dataset = Dataset(args.path_eval)
+
+        train_dl = get_data_loader(train_dataset, args.batch_size, ddp, pin_memory = "cuda" in device)
+        eval_dl = get_data_loader(eval_dataset, args.batch_size, ddp, pin_memory = "cuda" in device)
+
+        t.train(training_steps, train_dl, eval_dl, is_master, is_local_master, device, args.batch_size, ddp_world_size, 
+                num_images_inference = args.num_images_inference, 
+                num_generated_rows = args.num_rows_inference)
+    else:
+        mn = MappingNetwork(args.latent_dim, args.mn_depth, 
+                            lr_mul = args.mlp_lr_mul, 
+                            w_ema_beta = args.w_ema_beta).to(device)
+        
+        g = Generator(args.target_res, args.latent_dim, 
+                    network_capacity = args.network_capacity, 
+                    max_features = args.max_filters, 
+                    fir_filter = args.fir_filter_sampling,
+                    use_tanh_last = args.gen_use_tanh_last).to(device)
+        
+
+        d = Discriminator(args.target_res, args.images_in_channels, 
+                        network_capacity = args.network_capacity,
+                        max_features = args.max_filters,
+                        use_mbstd = args.disc_use_mbstd,
+                        mbstd_group_size = args.mbstd_group_size,
+                        mbstd_num_channels = args.mbstd_num_channels,
+                        fir_filter = args.fir_filter_sampling).to(device)
+        
+        if ddp:
+            mn = DistributedDataParallel(mn, device_ids = [ddp_local_rank])
+            g = DistributedDataParallel(g, device_ids = [ddp_local_rank])
+            d = DistributedDataParallel(d, device_ids = [ddp_local_rank])
+
+        train_dataset = Dataset(args.path_train)
+        eval_dataset = Dataset(args.path_eval)
+
+        train_dl = get_data_loader(train_dataset, args.batch_size, ddp, pin_memory = "cuda" in device)
+        eval_dl = get_data_loader(eval_dataset, args.batch_size, ddp, pin_memory = "cuda" in device)
+
+        t = Trainer(mn, g, d, args.model_dir, args.target_res,
+                    loss_type = args.loss_type, 
+                    save_every = args.save_every, 
+                    learning_rate = args.learning_rate, 
+                    grad_accum_steps = args.grad_accum, 
+                    style_mixing_prob = args.style_mixing_prob, 
+                    gen_ema_beta = args.gen_ema_beta, 
+                    ema_steps_threshold = args.ema_steps_threshold,
+                    style_mixing_prob_inference = args.style_mixing_probs_inference,
+                    truncation_psi_inference = args.truncation_psis_inference)
+        
+        training_steps = args.training_steps
+        if args.target_num_images is not None:
+            training_steps = int(args.target_num_images / (ddp_world_size * args.batch_size * args.grad_accum))
+
+        t.train(training_steps, train_dl, eval_dl, is_master, is_local_master, device, args.batch_size, ddp_world_size, 
+                num_images_inference = args.num_images_inference,
+                num_generated_rows = args.num_rows_inference)
+
+    if ddp:
+        destroy_process_group()

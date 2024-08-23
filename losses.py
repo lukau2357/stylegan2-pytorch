@@ -65,7 +65,7 @@ class GradientPenalty(torch.nn.Module):
 
         if self.gp_type == "wgan-gp":
             norm = torch.sqrt(norm)
-            return self.reg_weight * ((norm - 1) ** 2).mean()
+            return self.reg_weight * ((norm.sqrt() - 1) ** 2).mean()
 
         return (self.reg_weight / 2) * norm.mean()
 

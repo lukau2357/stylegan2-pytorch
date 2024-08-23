@@ -9,6 +9,7 @@ import csv
 
 from PIL import Image
 from typing import Union, List
+from torch.utils.data.distributed import DistributedSampler
 
 def preprocess(img_size, source_dir : str, target_dir : str, allowed_labels : List[str], center_crop_size : Union[float, None] = None, alpha : float = 1):
     """
@@ -57,16 +58,28 @@ class Dataset(torch.utils.data.Dataset):
     def __getitem__(self, idx) -> torch.Tensor:
         return torch.tensor(np.asarray(Image.open(self.imgs[idx])).transpose((2, 0, 1)).astype(np.float32))
 
-def get_data_loader(dataset : Dataset, batch_size : int, pin_memory : bool = True, num_workers : int = 0):
-    dl = torch.utils.data.DataLoader(
+def get_data_loader(dataset : Dataset, batch_size : int, is_ddp : bool, pin_memory : bool = True, num_workers : int = 0):
+    if is_ddp:
+        dl = torch.utils.data.DataLoader(
+                                       dataset, 
+                                       batch_size = batch_size, 
+                                       shuffle = False, 
+                                       collate_fn = lambda x: torch.stack(x, dim = 0) / 127.5 - 1, # Transform to range [-1, 1]
+                                       drop_last = True,
+                                       pin_memory = pin_memory,
+                                       num_workers = num_workers,
+                                       sampler = DistributedSampler(dataset, shuffle = True)) 
+        
+    else:
+        dl = torch.utils.data.DataLoader(
                                        dataset, 
                                        batch_size = batch_size, 
                                        shuffle = True, 
                                        pin_memory = pin_memory, 
                                        num_workers = num_workers, 
-                                       collate_fn = lambda x: torch.stack(x, dim = 0) / 127.5 - 1,
-                                       drop_last = True) # Transform to range [-1, 1]
-    
+                                       collate_fn = lambda x: torch.stack(x, dim = 0) / 127.5 - 1, # Transform to range [-1, 1]
+                                       drop_last = True) 
+        
     while True:
         for sample in dl:
             yield sample

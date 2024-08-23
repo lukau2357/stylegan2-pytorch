@@ -567,32 +567,3 @@ class Discriminator(torch.nn.Module):
         X = self.from_rgb(X)
         X = self.disc_blocks(X)
         return self.last(X)
-
-if __name__ == "__main__":
-    '''
-    DEVICE = "cuda"
-    g = Generator(128, 512).to(DEVICE)
-    mn = MappingNetwork(512, 8).to(DEVICE)
-    # w, _, _ = generate_style_mixes(mn, 128, 16, DEVICE)
-    z = torch.randn((16, 512), device = DEVICE).unsqueeze(0).repeat(2 * g.num_layers, 1, 1)
-    w, _, _ = new_style_mixing(mn, 16, DEVICE, 0.8, z.shape[0])
-
-    noise = generate_noise(128, 16, DEVICE)
-
-    images_z = g.forward(z, noise)
-    images_w = g.forward(w, noise)
-
-    images_z = samples_to_grid(images_z, 4)
-    images_w = samples_to_grid(images_w, 4)
-
-    Image.fromarray(images_z, mode = "RGB").save("z_images.jpg")
-    Image.fromarray(images_w, mode = "RGB").save("w_images.jpg")
-    '''
-    x = EqualizedWeight((3, 8, 3, 3))
-
-    y = x.weight.data
-    z = x().data
-    print(y)
-    print()
-    print(z)
-    print(torch.allclose(y, z))
