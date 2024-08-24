@@ -10,6 +10,7 @@ import csv
 from PIL import Image
 from typing import Union, List
 from torch.utils.data.distributed import DistributedSampler
+from torchvision import transforms
 
 def preprocess(img_size, source_dir : str, target_dir : str, allowed_labels : List[str], center_crop_size : Union[float, None] = None, alpha : float = 1):
     """
@@ -41,7 +42,7 @@ def preprocess(img_size, source_dir : str, target_dir : str, allowed_labels : Li
             image.save(os.path.join(target_dir, label))
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, path : str, alpha : float = 1):
+    def __init__(self, path : str, alpha : float = 1, is_inception : bool = False):
         """
         Constructor for custom RGB image Dataset class. 
         path - Name of the directory that contains images, preferably resized to a power of 2. Path should be given relative to cwd.
@@ -51,13 +52,23 @@ class Dataset(torch.utils.data.Dataset):
         self.alpha = alpha
         self.imgs = [os.path.join(path, item) for item in os.listdir(self.path)]
         self.imgs = self.imgs[:int(len(self.imgs) * alpha)]
-    
+        self.is_inception = is_inception
+        
+        # https://pytorch.org/hub/pytorch_vision_inception_v3/
+        if is_inception:
+            self.transforms = transforms.Compose([
+                transforms.Resize(299),
+                transforms.CenterCrop(299),
+                transforms.Normalize(mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225])
+            ])
+
     def __len__(self):
         return len(self.imgs)
 
     def __getitem__(self, idx) -> torch.Tensor:
-        return torch.tensor(np.asarray(Image.open(self.imgs[idx])).transpose((2, 0, 1)).astype(np.float32))
-
+        res = torch.tensor(np.asarray(Image.open(self.imgs[idx])).transpose((2, 0, 1)).astype(np.float32))
+        return self.transforms(res / 255.0) if self.is_inception else res
+    
 def get_data_loader(dataset : Dataset, batch_size : int, is_ddp : bool, pin_memory : bool = True, num_workers : int = 0):
     if is_ddp:
         dl = torch.utils.data.DataLoader(
@@ -79,12 +90,16 @@ def get_data_loader(dataset : Dataset, batch_size : int, is_ddp : bool, pin_memo
                                        num_workers = num_workers, 
                                        collate_fn = lambda x: torch.stack(x, dim = 0) / 127.5 - 1, # Transform to range [-1, 1]
                                        drop_last = True) 
-        
+ 
     while True:
         for sample in dl:
             yield sample
+    
+def get_inception_data_loader(dataset : Dataset, batch_size : int, pin_memory : bool = False, num_workers : int = 0):
+    return torch.utils.data.DataLoader(dataset, batch_size = batch_size, shuffle = False, collate_fn = lambda x: torch.stack(x, dim = 0), pin_memory = pin_memory, num_workers = num_workers)
 
 if __name__ == "__main__":
+    '''
     with open("./list_eval_partition.csv", "r", encoding = "utf-8") as f:
         csv_file = csv.reader(f)
         next(csv_file, None) # skip header
@@ -107,6 +122,7 @@ if __name__ == "__main__":
                 eval_labels.append(line[0])
         
         print(f"Train count: {train_count} Test count: {test_count} Eval count: {eval_count}")
+    '''
 
     '''
     preprocess(128, os.path.join("img_align_celeba", "img_align_celeba"), "celeba_128_train", train_labels + test_labels)
@@ -117,3 +133,13 @@ if __name__ == "__main__":
     print(len(train_labels + test_labels))
     print(len(eval_labels))
     '''
+
+    dataset_normal = Dataset("celeba_128_eval")
+    dataset_inception = Dataset("celeba_128_eval", is_inception = True)
+
+    dl_normal = get_data_loader(dataset_normal, 32, False)
+    dl_inception = get_inception_data_loader(dataset_inception, 32, False)
+
+    print(next(dl_normal))
+    print()
+    print(next(iter(dl_inception)))

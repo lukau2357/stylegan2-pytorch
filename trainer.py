@@ -11,11 +11,21 @@ import csv
 from model import Generator, Discriminator, MappingNetwork
 from dataset import Dataset, get_data_loader
 from typing import Union, Tuple, Type, List
-from utils import generate_noise, generate_samples, new_style_mixing
+from utils import generate_noise, generate_samples, style_mixing, samples_to_grid
 from PIL import Image
 from losses import FID
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel
+from contextlib import contextmanager
+
+@contextmanager
+def maybe_no_sync(module, condition):
+    if isinstance(module, DistributedDataParallel) and condition:
+        with module.no_sync():
+            yield
+        
+    else:
+        yield
 
 # For now, supports only single GPU training. Also, no gradient accumulation, for now.
 class Trainer:
@@ -45,7 +55,8 @@ class Trainer:
         gen_ema_beta : float = 0.999,
         grad_accum_steps : int = 1,
         compute_generator_ema : bool = True,
-        ema_steps_threshold : int = 1 # Compute Generator EMA starting from ema_steps_threshold,
+        ema_steps_threshold : int = 1, # Compute Generator EMA starting from ema_steps_threshold,
+        w_estimate_samples : int = 20000
     ):            
         self.root_path = root_path
         self.target_resolution = target_resolution
@@ -80,8 +91,9 @@ class Trainer:
         self.gen_ema_beta = gen_ema_beta
         self.compute_generator_ema = compute_generator_ema
         self.ema_steps_threshold = ema_steps_threshold
-        self.grad_accum_steps = grad_accum_steps
+        self.w_estimate_samples = w_estimate_samples
 
+        self.grad_accum_steps = grad_accum_steps
         self.disc_optim_steps = disc_optim_steps
         self.lazy_reg_steps_generator = lazy_reg_steps_generator
         self.lazy_reg_steps_discriminator = lazy_reg_steps_discriminator
@@ -109,25 +121,6 @@ class Trainer:
         self.optim_MN = torch.optim.Adam(MN.parameters(), lr = learning_rate * g_scale, betas = (adam_beta1 ** g_scale, adam_beta2 ** g_scale), eps = adam_eps)
         self.optim_G = torch.optim.Adam(G.parameters(), lr = learning_rate * g_scale, betas = (adam_beta1 ** g_scale, adam_beta2 ** g_scale), eps = adam_eps)
         self.optim_D = torch.optim.Adam(D.parameters(), lr = learning_rate * d_scale, betas = (adam_beta1 ** d_scale, adam_beta2 ** d_scale), eps = adam_eps)
-
-        if not os.path.exists(self.root_path):
-            os.mkdir(self.root_path)
-
-        # Seperate directory for storing samples obtained during training
-        if not os.path.exists(os.path.join(self.root_path, "samples")):
-            os.mkdir(os.path.join(self.root_path, "samples"))
-
-        with open(os.path.join(self.root_path, ".metadata.json"), "w+", encoding = "utf-8") as f:
-            json.dump(self.__global_metadata_dict(), f, indent = 4)
-     
-        self.__create_csv("d_adversarial_loss.csv", "adversarial_loss")
-        self.__create_csv("g_adversarial_loss.csv", "adversarial_loss")
-
-        if self.use_gp:
-            self.__create_csv("d_gp.csv", "gradient_penalty")
-        
-        if self.use_plr:
-            self.__create_csv("g_plr.csv", "path_length_regularization")
     
     def __create_csv(self, name, header):
         if not os.path.exists(os.path.join(self.root_path, name)):
@@ -227,6 +220,7 @@ class Trainer:
             "grad_accum_steps": self.grad_accum_steps,
             "compute_generator_ema": self.compute_generator_ema,
             "ema_steps_threshold": self.ema_steps_threshold,
+            "w_estimate_samples": self.w_estimate_samples,
             "mapping_network_params": self.__get_raw_model(self.MN).to_dict(),
             "generator_params": self.__get_raw_model(self.G).to_dict(),
             "discriminator_params": self.__get_raw_model(self.D).to_dict()
@@ -272,47 +266,42 @@ class Trainer:
         d_loss, gp_loss = 0, 0
 
         for i in range(self.grad_accum_steps):
-            real_samples = next(train_loader).to(device)
-            # Potential gradient penalty computation
-            real_samples.requires_grad_(should_reg)
+            with maybe_no_sync(self.D, i == self.grad_accum_steps - 1):
+                real_samples = next(train_loader).to(device)
+                # Potential gradient penalty computation
+                real_samples.requires_grad_(should_reg)
 
-            real_pred = self.__get_raw_model(self.D)(real_samples)
-            ws, _, _ = new_style_mixing(self.__get_raw_model(self.MN), batch_size, device, self.style_mixing_prob, self.__get_raw_model(self.G).num_layers * 2)
-            fake_samples = self.__get_raw_model(self.G)(ws, generate_noise(self.target_resolution, batch_size, device)).detach() # Detach generator from computational graph
-            fake_pred = self.__get_raw_model(self.D)(fake_samples)
+                real_pred = self.D(real_samples)
+                ws, _, _ = style_mixing(self.MN, self.__get_raw_model(self.G).num_layers * 2, batch_size, device, self.style_mixing_prob)
+                fake_samples = self.G(ws, generate_noise(self.target_resolution, batch_size, device)).detach() # Detach generator from computational graph
+                fake_pred = self.D(fake_samples)
 
-            current_d_loss = self.D_loss(real_pred, fake_pred) / self.grad_accum_steps
-            current_gp_loss = 0
+                current_d_loss = self.D_loss(real_pred, fake_pred) / self.grad_accum_steps
+                current_gp_loss = 0
 
-            d_loss += current_d_loss.item()
+                d_loss += current_d_loss.item()
 
-            if should_reg:
-                # Use R1 gradient penalty for vanilla GAN loss  
-                # Quote from StyleGAN2 paper: "We also multiply the regularization term by k to balance the overall magnitude of its gradients"          
-                if self.loss_type == "vanilla":
-                    current_gp_loss = (self.D_gp(real_samples, real_pred) / self.grad_accum_steps) * self.lazy_reg_steps_discriminator
+                if should_reg:
+                    # Use R1 gradient penalty for vanilla GAN loss  
+                    # Quote from StyleGAN2 paper: "We also multiply the regularization term by k to balance the overall magnitude of its gradients"          
+                    if self.loss_type == "vanilla":
+                        current_gp_loss = (self.D_gp(real_samples, real_pred) / self.grad_accum_steps) * self.lazy_reg_steps_discriminator
 
-                # For WGAN loss we use GP penalty, norm deviations from 1 and fake/real interpolation
-                else:
-                    ws, _, _ = new_style_mixing(self.__get_raw_model(self.MN), batch_size, device, self.style_mixing_prob, self.__get_raw_model(self.G).num_layers * 2)
-                    fake_samples = self.__get_raw_model(self.G)(ws, generate_noise(self.target_resolution, batch_size, device))
-                    current_gp_loss = (self.D_gp(real_samples, real_pred = None, fake_samples = fake_samples, critic = self.D) / self.grad_accum_steps) * self.lazy_reg_steps_discriminator
+                    # For WGAN loss we use GP penalty, norm deviations from 1 and fake/real interpolation
+                    else:
+                        ws, _, _ = style_mixing(self.MN, self.__get_raw_model(self.G).num_layers * 2, batch_size, device, self.style_mixing_prob)
+                        fake_samples = self.G(ws, generate_noise(self.target_resolution, batch_size, device))
+                        current_gp_loss = (self.D_gp(real_samples, real_pred = None, fake_samples = fake_samples, critic = self.D) / self.grad_accum_steps) * self.lazy_reg_steps_discriminator
+                    
+                    gp_loss += current_gp_loss
                 
-                gp_loss += current_gp_loss
-            
-            # Account for world_size when doing backward
-            current_loss = (current_d_loss + current_gp_loss) / world_size
-            if i < self.grad_accum_steps - 1 and isinstance(self.D, DistributedDataParallel):
-                with self.D.no_sync():
-                    current_loss.backward()
-            
-            # Synchronize gradients accross GPUs at the very last step of gradient accumulation!
-            else:
+                # Account for world_size when doing backward
+                current_loss = (current_d_loss + current_gp_loss) / world_size
                 current_loss.backward()
 
         self.optim_D.step()
-
         self.d_steps += 1
+
         return d_loss, gp_loss
 
     # Make private once initial tests are done
@@ -325,30 +314,25 @@ class Trainer:
         g_loss, plr_loss = 0, 0
 
         for i in range(self.grad_accum_steps):
-            ws, _, _ = new_style_mixing(self.__get_raw_model(self.MN), batch_size, device, self.style_mixing_prob, self.__get_raw_model(self.G).num_layers * 2)
-            fake_samples = self.__get_raw_model(self.G)(ws, generate_noise(self.target_resolution, batch_size, device))
-            fake_pred = self.__get_raw_model(self.D)(fake_samples)
+            with maybe_no_sync(self.G, i == self.grad_accum_steps - 1), maybe_no_sync(self.MN, i == self.grad_accum_steps - 1):
+                ws, _, _ = style_mixing(self.MN, self.__get_raw_model(self.G).num_layers * 2, batch_size, device, self.style_mixing_prob)
+                fake_samples = self.G(ws, generate_noise(self.target_resolution, batch_size, device))
+                fake_pred = self.D(fake_samples)
 
-            current_g_loss = self.G_loss(fake_pred) / self.grad_accum_steps
-            current_plr_loss = 0
+                current_g_loss = self.G_loss(fake_pred) / self.grad_accum_steps
+                current_plr_loss = 0
 
-            g_loss += current_g_loss
+                g_loss += current_g_loss
 
-            # Apparently path length regularization uses new fake samples from generator
-            # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/loss.py#L77
-            if should_reg:
-                ws, _, _ = new_style_mixing(self.__get_raw_model(self.MN), batch_size, device, self.style_mixing_prob, self.__get_raw_model(self.G).num_layers * 2)
-                fake_samples = self.__get_raw_model(self.G)(ws, generate_noise(self.target_resolution, batch_size, device))
-                current_plr_loss = (self.G_plr(ws, fake_samples)  / self.grad_accum_steps) * self.lazy_reg_steps_generator
-                plr_loss += current_plr_loss
-            
-            current_loss = (current_g_loss + current_plr_loss) / world_size
-            if i < self.grad_accum_steps - 1 and isinstance(self.G, DistributedDataParallel):
-                with self.G.no_sync():
-                    with self.MN.no_sync():
-                        current_loss.backward()
-
-            else:
+                # Apparently path length regularization uses new fake samples from generator
+                # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/loss.py#L77
+                if should_reg:
+                    ws, _, _ = style_mixing(self.MN, self.__get_raw_model(self.G).num_layers * 2, batch_size, device, self.style_mixing_prob)
+                    fake_samples = self.G(ws, generate_noise(self.target_resolution, batch_size, device))
+                    current_plr_loss = (self.G_plr(ws, fake_samples)  / self.grad_accum_steps) * self.lazy_reg_steps_generator
+                    plr_loss += current_plr_loss
+                
+                current_loss = (current_g_loss + current_plr_loss) / world_size
                 current_loss.backward()
 
         self.optim_MN.step()
@@ -433,6 +417,26 @@ class Trainer:
               num_images_inference : int = 16, 
               num_generated_rows : int = 1):
         
+        if is_master:
+            if not os.path.exists(self.root_path):
+                os.mkdir(self.root_path)
+
+            # Seperate directory for storing samples obtained during training
+            if not os.path.exists(os.path.join(self.root_path, "samples")):
+                os.mkdir(os.path.join(self.root_path, "samples"))
+
+            with open(os.path.join(self.root_path, ".metadata.json"), "w+", encoding = "utf-8") as f:
+                json.dump(self.__global_metadata_dict(), f, indent = 4)
+        
+            self.__create_csv("d_adversarial_loss.csv", "adversarial_loss")
+            self.__create_csv("g_adversarial_loss.csv", "adversarial_loss")
+
+            if self.use_gp:
+                self.__create_csv("d_gp.csv", "gradient_penalty")
+            
+            if self.use_plr:
+                self.__create_csv("g_plr.csv", "path_length_regularization")
+
         pbar = None
         if is_local_master:
             pbar = tqdm.tqdm(total = total_steps, initial = self.g_steps, position = 0, leave = True)
@@ -455,19 +459,19 @@ class Trainer:
                         for j, smp in enumerate(self.style_mixing_prob_inference):
                             # Possible that EMA models don't exist if current g_steps < ema_steps_threshold 
                             if self.MNE is not None:
-                                ema_samples = generate_samples(self.GE, self.MNE, self.target_resolution, device, num_images_inference, self.__get_raw_model(self.G).num_layers * 2,
+                                ema_samples = generate_samples(self.GE, self.MNE, self.target_resolution, device, num_images_inference,
                                                                 style_mixing_prob = smp,
                                                                 truncation_psi = psi,
                                                                 num_generated_rows = num_generated_rows,
-                                                                update_w_ema = False)
+                                                                w_estimate_samples = self.w_estimate_samples)
                                     
                                 Image.fromarray(ema_samples, mode = "RGB").save(os.path.join(self.root_path, "samples", f"ema_samples_{self.g_steps}_{i}{j}.jpg"))
 
-                            current_samples = generate_samples(self.__get_raw_model(self.G), self.__get_raw_model(self.MN), self.target_resolution, device, num_images_inference, self.__get_raw_model(self.G).num_layers * 2,
+                            current_samples = generate_samples(self.G, self.MN, self.target_resolution, device, num_images_inference,
                                                             style_mixing_prob = smp,
                                                             truncation_psi = psi,
                                                             num_generated_rows = num_generated_rows,
-                                                            update_w_ema = False)
+                                                            w_estimate_samples = self.w_estimate_samples)
                                 
                             Image.fromarray(current_samples, mode = "RGB").save(os.path.join(self.root_path, "samples", f"current_samples_{self.g_steps}_{i}{j}.jpg"))
             pbar.update(1)
@@ -499,8 +503,8 @@ def parse_args():
     parser.add_argument("--network_capacity", type = int, default = 8, help = "Multiplicative factor for number of filters in generator and discrimonator")
     parser.add_argument("--gen_use_tanh_last", type = bool, default = False, help = "Use tanh in the last layer of generator to keep images in [-1, 1]. StyleGAN2 paper does not use this in the last layer")
     parser.add_argument("--disc_use_mbstd", type = bool, default = True, help = "Use minibatch-std in last layer of discriminator")
-    parser.add_argument("--style_mixing_probs_inference", nargs = "+", default = [0.0], help = "Different style mixing probabilities to try during inference, pass as a space-seperated list of floats")
-    parser.add_argument("--truncation_psis_inference", nargs = "+", default = [0.0], help = "Different psi-s for truncation trick to use during inference, pass as a space-seperated list of floats")
+    parser.add_argument("--style_mixing_probs_inference", type = float, nargs = "+", default = [0.0], help = "Different style mixing probabilities to try during inference, pass as a space-seperated list of floats")
+    parser.add_argument("--truncation_psis_inference", type = float, nargs = "+", default = [1], help = "Different psi-s for truncation trick to use during inference, pass as a space-seperated list of floats")
     parser.add_argument("--fir_filter_sampling", nargs = "+", default = [1, 3, 3, 1], help = "Unnormalized FIR filter to use in upsampling/downsampling layers")
     parser.add_argument("--w_ema_beta", type = float, default = 0.995, help = "EMA coefficient to use when estimating mean style vector in mapping network during training")
     parser.add_argument("--max_filters", type = int, default = 512, help = "Maximum number of filters to use in convolutional layers of generator and discriminator")
@@ -512,22 +516,19 @@ def parse_args():
     parser.add_argument("--from_checkpoint", type = bool, nargs = "?", default = False, const = True, help = "Continue training from latest checkpoint in model_dir")
     parser.add_argument("--num_images_inference", type = int, default = 16, help = "Number of images to generate for inference")
     parser.add_argument("--num_rows_inference", type = int, default = 4, help = "Number of rows to present generated images during inference. Should divide num_images_inference")
-
+    parser.add_argument("--disc_optim_steps", type = int, default = 1, help = "Number of optimizations steps for discriminator, before optimizing generator")
+    parser.add_argument("--random_seed", type = int, default = 1337, help = "Random seed for reproducibility. In multi GPU regime, this will be offset by global rank of each GPU, so each GPU will end up with a different seed")
+    parser.add_argument("--no_w_ema", type = bool, nargs = "?", default = False, const = True, help = "Should mapping network use EMA for estimating mean style vector or not")
+    parser.add_argument("--w_estimate_samples", type = int, default = 20000, help = "Number of samples taken from multivariate standard Normal distribution to use to estimate average style vector for truncation, in case --no_w_ema is turned on")
     args = parser.parse_args()
     return args
 
-"""
-Remove device attribute from Trainer. Pass current device to Trainer.train(), from there pass it to __generator_step, __discriminator_step, __ema_step
-__ema_step should be done only from the master process - rank = 0 - master_process flag to trainer as well
-"""
-
 if __name__ == "__main__":
     args = parse_args()
-    print(args)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ddp = int(os.environ.get('RANK', -1)) != -1
-
+    
     if ddp:
         backend = args.ddp_backend
         init_process_group(backend = backend)
@@ -540,11 +541,7 @@ if __name__ == "__main__":
         is_master = ddp_rank == 0
         is_local_master = ddp_local_rank == 0
         seed_offset = ddp_rank # each process gets a different seed
-        
-        if is_master:
-            print("Is DDP")
-            print(f"DDP world size: {ddp_world_size}")
-        
+                
     else:
         # if not ddp, we are running on a single gpu, and one process
         is_master = True
@@ -553,9 +550,12 @@ if __name__ == "__main__":
         ddp_world_size = 1
         ddp_rank = 0
         ddp_local_rank = 0
-        
-        print("Not DDP")
     
+    if is_master:
+        print(args)
+    
+    torch.manual_seed(args.random_seed + seed_offset)
+
     if args.from_checkpoint:
         t = Trainer.from_trained(args.model_dir, ddp_local_rank, device, ddp, is_master)
 
@@ -572,10 +572,12 @@ if __name__ == "__main__":
         t.train(training_steps, train_dl, eval_dl, is_master, is_local_master, device, args.batch_size, ddp_world_size, 
                 num_images_inference = args.num_images_inference, 
                 num_generated_rows = args.num_rows_inference)
+        
     else:
         mn = MappingNetwork(args.latent_dim, args.mn_depth, 
                             lr_mul = args.mlp_lr_mul, 
-                            w_ema_beta = args.w_ema_beta).to(device)
+                            estimate_w = not args.no_w_ema,
+                            w_ema_beta = args.w_ema_beta,).to(device)
         
         g = Generator(args.target_res, args.latent_dim, 
                     network_capacity = args.network_capacity, 
@@ -593,16 +595,17 @@ if __name__ == "__main__":
                         fir_filter = args.fir_filter_sampling).to(device)
         
         if ddp:
-            mn = DistributedDataParallel(mn, device_ids = [ddp_local_rank])
-            g = DistributedDataParallel(g, device_ids = [ddp_local_rank])
-            d = DistributedDataParallel(d, device_ids = [ddp_local_rank])
+            # TODO: Change 0 to ddp_local_rank once testing is finished
+            mn = DistributedDataParallel(mn, device_ids = [0])
+            g = DistributedDataParallel(g, device_ids = [0])
+            d = DistributedDataParallel(d, device_ids = [0])
 
         train_dataset = Dataset(args.path_train)
         eval_dataset = Dataset(args.path_eval)
 
         train_dl = get_data_loader(train_dataset, args.batch_size, ddp, pin_memory = "cuda" in device)
         eval_dl = get_data_loader(eval_dataset, args.batch_size, ddp, pin_memory = "cuda" in device)
-
+        
         t = Trainer(mn, g, d, args.model_dir, args.target_res,
                     loss_type = args.loss_type, 
                     save_every = args.save_every, 
@@ -612,9 +615,12 @@ if __name__ == "__main__":
                     gen_ema_beta = args.gen_ema_beta, 
                     ema_steps_threshold = args.ema_steps_threshold,
                     style_mixing_prob_inference = args.style_mixing_probs_inference,
-                    truncation_psi_inference = args.truncation_psis_inference)
+                    truncation_psi_inference = args.truncation_psis_inference,
+                    disc_optim_steps = args.disc_optim_steps,
+                    w_estimate_samples = args.w_estimate_samples)
         
         training_steps = args.training_steps
+
         if args.target_num_images is not None:
             training_steps = int(args.target_num_images / (ddp_world_size * args.batch_size * args.grad_accum))
 

@@ -1,11 +1,8 @@
 import torch
 import numpy as np
 import math
-import torchvision
 
 from typing import Tuple, List, Union, Type
-from utils import generate_noise, generate_style_mixes, samples_to_grid, new_style_mixing
-from PIL import Image
 
 class LeakyReLUGained(torch.nn.Module):
     def __init__(self, p : float = 0.2, gain : float = 1):
@@ -110,13 +107,17 @@ class MappingNetwork(torch.nn.Module):
     factor of decay. Keep in mind that this is not exactly equivalent to explicitly modyfing the learning rate within the optimizer for desired parameters, but it gets
     the job done apparently.
     """
-    def __init__(self, latent_dim : int, depth : int, lr_mul : float = 0.01, w_ema_beta : float = 0.995):
+    def __init__(self, latent_dim : int, depth : int, lr_mul : float = 0.01, estimate_w : bool = True, w_ema_beta : float = 0.995):
         super().__init__()
         self.latent_dim = latent_dim
         self.depth = depth
         self.lr_mul = lr_mul
-        self.w_ema_beta = w_ema_beta
-        self.w_ema = torch.nn.Parameter(torch.zeros((latent_dim)), requires_grad = False)
+        self.estimate_w = estimate_w
+
+        if estimate_w:
+            self.w_ema_beta = w_ema_beta
+            self.w_ema = torch.nn.Parameter(torch.zeros((latent_dim)), requires_grad = False)
+
         layers = []
 
         for _ in range(depth):
@@ -133,16 +134,19 @@ class MappingNetwork(torch.nn.Module):
             "latent_dim": self.latent_dim,
             "depth": self.depth,
             "lr_mul": self.lr_mul,
-            "w_ema_beta": self.w_ema_beta
+            "estimate_w" : self.estimate_w
         }
+
+        if self.estimate_w:
+            d["w_ema_beta"] = self.w_ema_beta
 
         return d
 
     @classmethod
     def from_dict(cls : Type["MappingNetwork"], d) -> Type["MappingNetwork"]:
-        return cls(d["latent_dim"], d["depth"], d["lr_mul"], d["w_ema_beta"])
+        return cls(d["latent_dim"], d["depth"], lr_mul = d["lr_mul"], estimate_w = d["estimate_w"], w_ema_beta = d.get("w_ema_beta", 0.0))
 
-    def forward(self, z : torch.Tensor, truncation_psi : float = 1, update_w_ema : bool = True) -> torch.Tensor:
+    def forward(self, z : torch.Tensor, update_w_ema : bool = True, truncation_psi : float = 1, w_mean_estimate : Union[torch.Tensor, None] = None) -> torch.Tensor:
         """
         z: (batch_size, latent_dim). 
         Return:
@@ -152,12 +156,15 @@ class MappingNetwork(torch.nn.Module):
         z = z / (torch.sqrt(z.square().mean(dim = 1, keepdim = True) + 1e-8)) # RMS-norm-esque
         w = self.net(z)
 
-        if update_w_ema:
+        if update_w_ema and self.estimate_w:
             # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/d72cc7d041b42ec8e806021a205ed9349f87c6a4/training/networks.py#L234
             self.w_ema.copy_(w.detach().mean(dim = 0).lerp(self.w_ema, self.w_ema_beta))
-
+        
         if truncation_psi < 1:
-            return (1 - truncation_psi) * self.w_ema + truncation_psi * w
+            if self.estimate_w:
+                return (1 - truncation_psi) * self.w_ema + truncation_psi * w
+
+            return (1 - truncation_psi) * w_mean_estimate + truncation_psi * w
         
         return w
 
@@ -353,7 +360,11 @@ class Generator(torch.nn.Module):
     
     @classmethod
     def from_dict(cls : Type["Generator"], d) -> Type["Generator"]:
-        return cls(d["image_size"], d["latent_dim"], d["network_capacity"], d["max_features"], d["fir_filter"], d["use_tanh_last"])
+        return cls(d["image_size"], d["latent_dim"], 
+                   network_capacity = d["network_capacity"], 
+                   max_features = d["max_features"], 
+                   fir_filter = d["fir_filter"], 
+                   use_tanh_last = d["use_tanh_last"])
     
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -555,7 +566,13 @@ class Discriminator(torch.nn.Module):
     
     @classmethod
     def from_dict(cls : Type["Discriminator"], d) -> "Discriminator":
-        return cls(d["input_res"], d["in_channels"], d["network_capacity"], d["max_features"], d["use_mbstd"], d["mbstd_group_size"], d["mbstd_num_channels"], d["fir_filter"])
+        return cls(d["input_res"], d["in_channels"], 
+                   network_capacity = d["network_capacity"], 
+                   max_features = d["max_features"], 
+                   use_mbstd = d["use_mbstd"], 
+                   mbstd_group_size = d["mbstd_group_size"], 
+                   mbstd_num_channels = d["mbstd_num_channels"], 
+                   fir_filter = d["fir_filter"])
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
