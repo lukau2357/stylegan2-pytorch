@@ -129,13 +129,16 @@ class MappingNetwork(torch.nn.Module):
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def to_dict(self) -> dict:
+    def to_dict(self, state_dict : bool = False) -> dict:
         d = {
             "latent_dim": self.latent_dim,
             "depth": self.depth,
             "lr_mul": self.lr_mul,
             "estimate_w" : self.estimate_w
         }
+
+        if state_dict:
+            d["state_dict"] = self.state_dict()
 
         if self.estimate_w:
             d["w_ema_beta"] = self.w_ema_beta
@@ -144,7 +147,12 @@ class MappingNetwork(torch.nn.Module):
 
     @classmethod
     def from_dict(cls : Type["MappingNetwork"], d) -> Type["MappingNetwork"]:
-        return cls(d["latent_dim"], d["depth"], lr_mul = d["lr_mul"], estimate_w = d["estimate_w"], w_ema_beta = d.get("w_ema_beta", 0.0))
+        res = cls(d["latent_dim"], d["depth"], lr_mul = d["lr_mul"], estimate_w = d["estimate_w"], w_ema_beta = d.get("w_ema_beta", 0.0))
+        
+        if "state_dict" in d:
+            res.load_state_dict(d["state_dict"])
+        
+        return res
 
     def forward(self, z : torch.Tensor, update_w_ema : bool = True, truncation_psi : float = 1, w_mean_estimate : Union[torch.Tensor, None] = None) -> torch.Tensor:
         """
@@ -266,15 +274,16 @@ class ToRgb(torch.nn.Module):
         return rgb + self.bias[None, :, None, None]
     
 class GeneratorBlock(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, latent_dim):
+    def __init__(self, in_channels, out_channels, latent_dim, rgb_out_channels = 3):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.latent_dim = latent_dim
+        self.rgb_out_channels = rgb_out_channels
 
         self.gen_block_1 = StyleBlock(in_channels, out_channels, latent_dim)
         self.gen_block_2 = StyleBlock(out_channels, out_channels, latent_dim)
-        self.trgb = ToRgb(latent_dim, out_channels)
+        self.trgb = ToRgb(latent_dim, out_channels, out_channels = rgb_out_channels)
     
     def forward(self, X: torch.Tensor, w : torch.Tensor, noise : Tuple[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         X = self.gen_block_1(X, w[0], noise[0])
@@ -326,12 +335,19 @@ class Downsample(torch.nn.Module):
         return self.downsample(self.smooth(X))
 
 class Generator(torch.nn.Module):
-    def __init__(self, image_size : int, latent_dim : int, network_capacity : int = 8, max_features : int = 512, fir_filter : List[int] = [1, 3, 3, 1], use_tanh_last : bool = False):
+    def __init__(self, image_size : int, latent_dim : int, 
+                 network_capacity : int = 8, 
+                 max_features : int = 512, 
+                 fir_filter : List[int] = [1, 3, 3, 1], 
+                 use_tanh_last : bool = False,
+                 rgb_out_channels : int = 3):
         super().__init__()
         self.image_size = image_size
         self.latent_dim = latent_dim
         self.network_capacity = network_capacity
         self.max_features = max_features
+        self.use_tanh_last = use_tanh_last
+        self.rgb_out_channels = rgb_out_channels
 
         # Channel shrinking strategy per resolution taken from https://github.com/lucidrains/stylegan2-pytorch/blob/master/stylegan2_pytorch/stylegan2_pytorch.py
         # StyleGan papers are too ambiguous in this regard. With network_capacity = 8 and image_size = 1024, obtained number of filters per resolution
@@ -340,31 +356,40 @@ class Generator(torch.nn.Module):
         self.filters = [min(max_features, network_capacity * (2 ** (i + 1))) for i in range(self.num_layers)][::-1]
         self.start_tensor = torch.nn.Parameter(torch.randn(1, self.filters[0], 4, 4))
         self.style_start = StyleBlock(self.filters[0], self.filters[0], latent_dim)
-        self.to_rgb_start = ToRgb(latent_dim, self.filters[0])
-        self.use_tanh_last = use_tanh_last
+        self.to_rgb_start = ToRgb(latent_dim, self.filters[0], out_channels = rgb_out_channels)
         self.blocks = torch.nn.ModuleList([GeneratorBlock(self.filters[i - 1], self.filters[i], latent_dim) for i in range(1, len(self.filters))])
         self.fir_filter = fir_filter
         self.upsample = Upsample(fir_filter = fir_filter)
 
-    def to_dict(self) -> dict:
+    def to_dict(self, state_dict : bool = False) -> dict:
         d = {
             "image_size": self.image_size,
             "latent_dim": self.latent_dim,
             "network_capacity": self.network_capacity,
             "max_features": self.max_features,
             "fir_filter": self.fir_filter,
-            "use_tanh_last": self.use_tanh_last
+            "use_tanh_last": self.use_tanh_last,
+            "rgb_out_channels" : self.rgb_out_channels
         }
+
+        if state_dict:
+            d["state_dict"] = self.state_dict()
 
         return d
     
     @classmethod
     def from_dict(cls : Type["Generator"], d) -> Type["Generator"]:
-        return cls(d["image_size"], d["latent_dim"], 
+        res = cls(d["image_size"], d["latent_dim"], 
                    network_capacity = d["network_capacity"], 
                    max_features = d["max_features"], 
                    fir_filter = d["fir_filter"], 
-                   use_tanh_last = d["use_tanh_last"])
+                   use_tanh_last = d["use_tanh_last"],
+                   rgb_out_channels = d["rgb_out_channels"])
+
+        if "state_dict" in d:
+            res.load_state_dict(d["state_dict"])
+        
+        return res
     
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -540,8 +565,7 @@ class Discriminator(torch.nn.Module):
 
         # FromRGB extends the number of channels to self.filters[0] with kernel size 1, with Leaky ReLU application.
         # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/networks.py#L543
-        # For now, working with RGB images only - 3 input chanels that is.
-        self.from_rgb = torch.nn.Sequential(EqualizedConv2d(3, self.filters[0], 1), self.lrelu)
+        self.from_rgb = torch.nn.Sequential(EqualizedConv2d(self.in_channels, self.filters[0], 1), self.lrelu)
         self.fir_filter = fir_filter
         self.disc_blocks = torch.nn.Sequential(*[
             DiscriminatorBlock(self.filters[i], self.filters[i + 1], fir_filter = fir_filter) for i in range(len(self.filters) - 1)
@@ -550,7 +574,7 @@ class Discriminator(torch.nn.Module):
         # TODO: Last resolution hardcoded to 4, perhaps make it dynamic somehow?
         self.last = DiscriminatorEpilogue(self.filters[-1], 4, use_mbstd = use_mbstd, mbstd_group_size = mbstd_group_size, mbstd_num_channels = mbstd_num_channels)
     
-    def to_dict(self) -> dict:
+    def to_dict(self, state_dict : bool = False) -> dict:
         d = {
             "input_res": self.input_res,
             "in_channels": self.in_channels,
@@ -562,17 +586,25 @@ class Discriminator(torch.nn.Module):
             "fir_filter": self.fir_filter
         }
 
+        if state_dict:
+            d["state_dict"] = self.state_dict()
+
         return d
     
     @classmethod
     def from_dict(cls : Type["Discriminator"], d) -> "Discriminator":
-        return cls(d["input_res"], d["in_channels"], 
+        res = cls(d["input_res"], d["in_channels"], 
                    network_capacity = d["network_capacity"], 
                    max_features = d["max_features"], 
                    use_mbstd = d["use_mbstd"], 
                    mbstd_group_size = d["mbstd_group_size"], 
                    mbstd_num_channels = d["mbstd_num_channels"], 
                    fir_filter = d["fir_filter"])
+        
+        if "state_dict" in d:
+            res.load_state_dict(d["state_dict"])
+        
+        return res
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -584,3 +616,18 @@ class Discriminator(torch.nn.Module):
         X = self.from_rgb(X)
         X = self.disc_blocks(X)
         return self.last(X)
+    
+if __name__ == "__main__":
+    import os
+    mn_d = torch.load(os.path.join("another_test", "last_checkpoint", "MN.pth"))
+    g_d = torch.load(os.path.join("another_test", "last_checkpoint", "G.pth"))
+
+    device = "cuda"
+    MN = MappingNetwork.from_dict(mn_d).to(device)
+    G = Generator.from_dict(g_d).to(device)
+
+    from utils import generate_samples
+
+    imgs = generate_samples(G, MN, device, 16, style_mixing_prob = 0, num_generated_rows = 4)
+    from PIL import Image
+    Image.fromarray(imgs, mode = "RGB").show()

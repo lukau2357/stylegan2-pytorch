@@ -96,6 +96,7 @@ def get_data_loader(dataset : Dataset, batch_size : int, is_ddp : bool, pin_memo
             yield sample
     
 def get_inception_data_loader(dataset : Dataset, batch_size : int, pin_memory : bool = False, num_workers : int = 0):
+    # No shuffling for inception data loader to avoid non-deterministic FID due to floating point associativity issues
     return torch.utils.data.DataLoader(dataset, batch_size = batch_size, shuffle = False, collate_fn = lambda x: torch.stack(x, dim = 0), pin_memory = pin_memory, num_workers = num_workers)
 
 if __name__ == "__main__":
@@ -133,13 +134,3 @@ if __name__ == "__main__":
     print(len(train_labels + test_labels))
     print(len(eval_labels))
     '''
-
-    dataset_normal = Dataset("celeba_128_eval")
-    dataset_inception = Dataset("celeba_128_eval", is_inception = True)
-
-    dl_normal = get_data_loader(dataset_normal, 32, False)
-    dl_inception = get_inception_data_loader(dataset_inception, 32, False)
-
-    print(next(dl_normal))
-    print()
-    print(next(iter(dl_inception)))

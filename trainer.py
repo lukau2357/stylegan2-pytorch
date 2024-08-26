@@ -11,7 +11,7 @@ import csv
 from model import Generator, Discriminator, MappingNetwork
 from dataset import Dataset, get_data_loader
 from typing import Union, Tuple, Type, List
-from utils import generate_noise, generate_samples, style_mixing, samples_to_grid
+from utils import generate_noise, generate_samples, style_mixing, find_label
 from PIL import Image
 from losses import FID
 from torch.distributed import init_process_group, destroy_process_group
@@ -56,7 +56,8 @@ class Trainer:
         grad_accum_steps : int = 1,
         compute_generator_ema : bool = True,
         ema_steps_threshold : int = 1, # Compute Generator EMA starting from ema_steps_threshold,
-        w_estimate_samples : int = 20000
+        w_estimate_samples : int = 20000,
+        save_total_limit : int = 1
     ):            
         self.root_path = root_path
         self.target_resolution = target_resolution
@@ -92,6 +93,8 @@ class Trainer:
         self.compute_generator_ema = compute_generator_ema
         self.ema_steps_threshold = ema_steps_threshold
         self.w_estimate_samples = w_estimate_samples
+        self.save_total_limit = save_total_limit
+        self.save_history = []
 
         self.grad_accum_steps = grad_accum_steps
         self.disc_optim_steps = disc_optim_steps
@@ -137,7 +140,11 @@ class Trainer:
         return model if not isinstance(model, DistributedDataParallel) else model.module
     
     @classmethod
-    def from_trained(cls : Type["Trainer"], root_path : str, local_rank : int, device : str, is_ddp : bool, is_master_process : bool):
+    def from_trained(cls : Type["Trainer"], root_path : str, local_rank : int, device : str, is_ddp : bool, is_master_process : bool,
+                     checkpoint : Union[str, None] = None):
+        '''
+        Load latest, load specific checkpoint or load checkpoint that obtained best FID so far
+        '''
         def from_checkpoint(root, checkpoint) -> Type["Trainer"]:
             checkpoint_path = os.path.join(root, checkpoint)
 
@@ -147,13 +154,13 @@ class Trainer:
             with open(os.path.join(checkpoint_path, ".metadata.json"), "r", encoding = "utf-8") as f:
                 local_metadata = json.load(f)
 
-            MN = MappingNetwork.from_dict(global_metadata["mapping_network_params"]).to(device)
-            G = Generator.from_dict(global_metadata["generator_params"]).to(device)
-            D = Discriminator.from_dict(global_metadata["discriminator_params"]).to(device)
+            MN_d = torch.load(os.path.join(checkpoint_path, "MN.pth"))
+            G_d = torch.load(os.path.join(checkpoint_path, "G.pth"))
+            D_d = torch.load(os.path.join(checkpoint_path, "D.pth"))
 
-            MN.load_state_dict(torch.load(os.path.join(checkpoint_path, "MN.pth"), weights_only = True))
-            G.load_state_dict(torch.load(os.path.join(checkpoint_path, "G.pth"), weights_only = True))
-            D.load_state_dict(torch.load(os.path.join(checkpoint_path, "D.pth"), weights_only = True))
+            MN = MappingNetwork.from_dict(MN_d).to(device)
+            G = Generator.from_dict(G_d).to(device)
+            D = Discriminator.from_dict(D_d).to(device)
 
             if is_ddp:
                 MN = DistributedDataParallel(MN, device_ids = [local_rank])
@@ -164,10 +171,10 @@ class Trainer:
             MNE, GE = None, None
 
             if os.path.exists(mne_path) and is_master_process:
-                MNE = MappingNetwork.from_dict(global_metadata["mapping_network_params"]).to(device)
-                GE = Generator.from_dict(global_metadata["generator_params"]).to(device)
-                MNE.load_state_dict(torch.load(mne_path, weights_only = True))
-                GE.load_state_dict(torch.load(os.path.join(checkpoint_path, "GE.pth"), weights_only = True))
+                MN_d = torch.load(os.path.join(checkpoint_path, "MNE.pth"))
+                G_d = torch.load(os.path.join(checkpoint_path, "GE.pth"))
+                MNE = MappingNetwork.from_dict(MN_d).to(device)
+                GE = Generator.from_dict(G_d).to(device)
 
             kwargs_metadata = copy.deepcopy(global_metadata)
             kwargs_metadata.pop("target_resolution")
@@ -183,18 +190,25 @@ class Trainer:
             
             res.d_steps = local_metadata["d_steps"]
             res.g_steps = local_metadata["g_steps"]
+            res.save_history = local_metadata["save_history"]
 
-            res.optim_MN.load_state_dict(torch.load(os.path.join(checkpoint_path, "MN_optimizer.pth"), weights_only = True))
-            res.optim_G.load_state_dict(torch.load(os.path.join(checkpoint_path, "G_optimizer.pth"), weights_only = True))
-            res.optim_D.load_state_dict(torch.load(os.path.join(checkpoint_path, "D_optimizer.pth"), weights_only = True))
+            res.optim_MN.load_state_dict(torch.load(os.path.join(checkpoint_path, "MN_optimizer.pth")))
+            res.optim_G.load_state_dict(torch.load(os.path.join(checkpoint_path, "G_optimizer.pth")))
+            res.optim_D.load_state_dict(torch.load(os.path.join(checkpoint_path, "D_optimizer.pth")))
 
             if MNE is not None:
                 res.MNE = MNE
                 res.GE = GE
 
             return res
-        
-        return from_checkpoint(root_path, "last_checkpoint")
+                
+        # 1. Load from specified checkpoint
+        if checkpoint is not None:
+            return from_checkpoint(root_path, checkpoint)
+
+        # 2. Load latest checkpoint
+        target_label = find_label(root_path, "g_steps", lambda x, y : x > y)
+        return from_checkpoint(root_path, target_label)
                 
     def __global_metadata_dict(self) -> dict:
         d = {
@@ -223,7 +237,8 @@ class Trainer:
             "w_estimate_samples": self.w_estimate_samples,
             "mapping_network_params": self.__get_raw_model(self.MN).to_dict(),
             "generator_params": self.__get_raw_model(self.G).to_dict(),
-            "discriminator_params": self.__get_raw_model(self.D).to_dict()
+            "discriminator_params": self.__get_raw_model(self.D).to_dict(),
+            "save_total_limit": self.save_total_limit
         }
 
         return d
@@ -231,7 +246,8 @@ class Trainer:
     def __local_metadata_dict(self) -> dict:
         d = {
             "d_steps": self.d_steps,
-            "g_steps": self.g_steps
+            "g_steps": self.g_steps,
+            "save_history": self.save_history
         }
 
         return d
@@ -248,16 +264,16 @@ class Trainer:
         with open(os.path.join(path, ".metadata.json"), "w+", encoding = "utf-8") as f:
             json.dump(self.__local_metadata_dict(), f, indent = 4)
         
-        torch.save(self.MN.state_dict(), os.path.join(path, "MN.pth"))
-        torch.save(self.G.state_dict(), os.path.join(path, "G.pth"))
-        torch.save(self.D.state_dict(), os.path.join(path, "D.pth"))
+        torch.save(self.MN.to_dict(state_dict = True), os.path.join(path, "MN.pth"))
+        torch.save(self.G.to_dict(state_dict = True), os.path.join(path, "G.pth"))
+        torch.save(self.D.to_dict(state_dict = True), os.path.join(path, "D.pth"))
         torch.save(self.optim_MN.state_dict(), os.path.join(path, "MN_optimizer.pth"))
         torch.save(self.optim_G.state_dict(), os.path.join(path, "G_optimizer.pth"))
         torch.save(self.optim_D.state_dict(), os.path.join(path, "D_optimizer.pth"))
         
         if self.MNE is not None:
-            torch.save(self.MNE.state_dict(), os.path.join(path, "MNE.pth"))
-            torch.save(self.GE.state_dict(), os.path.join(path, "GE.pth"))
+            torch.save(self.MNE.to_dict(state_dict = True), os.path.join(path, "MNE.pth"))
+            torch.save(self.GE.to_dict(state_dict = True), os.path.join(path, "GE.pth"))
         
     def __discriminator_step(self, world_size : int, batch_size : int, train_loader : torch.utils.data.DataLoader, device : str):
         self.optim_D.zero_grad()
@@ -340,7 +356,8 @@ class Trainer:
         self.g_steps += 1
         return g_loss, plr_loss
     
-    def __ema_generator_step(self):
+
+    def __ema_generator_step(self, device : str):
         """
         Perform exponential moving average update of Generator weights (including the mapping network), using gen_ema_coeff. 
         This was first introduced, to my knowledge at least in ProGAN paper, https://arxiv.org/pdf/1710.10196. Another paper goes into mathematical details
@@ -355,8 +372,8 @@ class Trainer:
             return
         
         if self.GE is None:
-            self.GE = copy.deepcopy(self.G).to(self.device).eval()
-            self.MNE = copy.deepcopy(self.MN).to(self.device).eval()
+            self.GE = copy.deepcopy(self.G).to(device).eval()
+            self.MNE = copy.deepcopy(self.MN).to(device).eval()
             return
         
         with torch.no_grad():
@@ -408,7 +425,6 @@ class Trainer:
     def train(self, 
               total_steps : int, 
               train_loader : torch.utils.data.DataLoader, 
-              val_loader : torch.utils.data.DataLoader,
               is_master : bool,
               is_local_master : bool,
               device : str,
@@ -447,10 +463,20 @@ class Trainer:
             if not is_master:
                 continue
 
-            self.__ema_generator_step()
+            self.__ema_generator_step(device)
             
             if self.g_steps % self.save_every == 0 or self.g_steps == total_steps:
-                self.__create_checkpoint("last_checkpoint")
+                if self.save_total_limit == len(self.save_history):
+                    target_steps = self.save_history[0]
+                    target_label = find_label(self.root_path, "g_steps", lambda x, y : x == target_steps, assume_first = False)
+
+                    if target_label is not None:
+                        shutil.rmtree(os.path.join(self.root_path, target_label))
+
+                    self.save_history.pop(0)
+                
+                self.save_history.append(self.g_steps)
+                self.__create_checkpoint(f"checkpoint_{self.g_steps}")
 
                 # TODO: Sampling only for now, incorporate FID computation
                 # Also save which combination of psi and style mixing probability gave best FID score
@@ -459,7 +485,7 @@ class Trainer:
                         for j, smp in enumerate(self.style_mixing_prob_inference):
                             # Possible that EMA models don't exist if current g_steps < ema_steps_threshold 
                             if self.MNE is not None:
-                                ema_samples = generate_samples(self.GE, self.MNE, self.target_resolution, device, num_images_inference,
+                                ema_samples = generate_samples(self.GE, self.MNE, device, num_images_inference,
                                                                 style_mixing_prob = smp,
                                                                 truncation_psi = psi,
                                                                 num_generated_rows = num_generated_rows,
@@ -467,7 +493,7 @@ class Trainer:
                                     
                                 Image.fromarray(ema_samples, mode = "RGB").save(os.path.join(self.root_path, "samples", f"ema_samples_{self.g_steps}_{i}{j}.jpg"))
 
-                            current_samples = generate_samples(self.G, self.MN, self.target_resolution, device, num_images_inference,
+                            current_samples = generate_samples(self.G, self.MN, device, num_images_inference,
                                                             style_mixing_prob = smp,
                                                             truncation_psi = psi,
                                                             num_generated_rows = num_generated_rows,
@@ -511,7 +537,7 @@ def parse_args():
     parser.add_argument("--mbstd_group_size", type = int, default = 4, help = "Minibatch standard deviation group size for discriminator, --batch-size should be divisible by this")
     parser.add_argument("--mbstd_num_channels", type = int, default = 1, help = "Minibatch standard deviation number of channels for discriminator, should divide number of channels at the output of discriminator, before applying minibatchstd and flatten")
     # TODO: Pass this to both generator and discriminator
-    parser.add_argument("--images_in_channels", type = int, default = 3, help = "Number of channels for images to be considered by the model")
+    parser.add_argument("--images_in_channels", type = int, default = 3, help = "Number of channels generated images/inspected images should have, 3 for RGB, 4 for RGBA, 1 for grayscale, etc.")
     parser.add_argument("--ddp_backend", type = str, default = "nccl", help = "DDP backend to use. If training on CPU, you should use gloo. Supported backends, and DDP documentation is available at: https://pytorch.org/docs/stable/distributed.html. If running from Windows, you might want to run with gloo, as nccl is not supported (at least at the time of writhing these scripts)")
     parser.add_argument("--from_checkpoint", type = bool, nargs = "?", default = False, const = True, help = "Continue training from latest checkpoint in model_dir")
     parser.add_argument("--num_images_inference", type = int, default = 16, help = "Number of images to generate for inference")
@@ -520,6 +546,9 @@ def parse_args():
     parser.add_argument("--random_seed", type = int, default = 1337, help = "Random seed for reproducibility. In multi GPU regime, this will be offset by global rank of each GPU, so each GPU will end up with a different seed")
     parser.add_argument("--no_w_ema", type = bool, nargs = "?", default = False, const = True, help = "Should mapping network use EMA for estimating mean style vector or not")
     parser.add_argument("--w_estimate_samples", type = int, default = 20000, help = "Number of samples taken from multivariate standard Normal distribution to use to estimate average style vector for truncation, in case --no_w_ema is turned on")
+    parser.add_argument("--specific_checkpoint", type = str, default = None, help = "Continue training from specific specific checkpoint inside moedl_dir")
+    parser.add_argument("--best_fid", type = bool, nargs = "?", default = False, const = True, help = "Continue training from checkpoint with best FID")
+    parser.add_argument("--save_total_limit", type = int, default = 1, help = "Specifies number of model checkpoints that should be rotated")
     args = parser.parse_args()
     return args
 
@@ -557,19 +586,16 @@ if __name__ == "__main__":
     torch.manual_seed(args.random_seed + seed_offset)
 
     if args.from_checkpoint:
-        t = Trainer.from_trained(args.model_dir, ddp_local_rank, device, ddp, is_master)
+        t = Trainer.from_trained(args.model_dir, ddp_local_rank, device, ddp, is_master, checkpoint = args.specific_checkpoint, best_fid = args.best_fid)
 
         training_steps = args.training_steps
         if args.target_num_images is not None:
             training_steps = int(args.target_num_images / (ddp_world_size * args.batch_size * args.grad_accum))
 
         train_dataset = Dataset(args.path_train)
-        eval_dataset = Dataset(args.path_eval)
-
         train_dl = get_data_loader(train_dataset, args.batch_size, ddp, pin_memory = "cuda" in device)
-        eval_dl = get_data_loader(eval_dataset, args.batch_size, ddp, pin_memory = "cuda" in device)
 
-        t.train(training_steps, train_dl, eval_dl, is_master, is_local_master, device, args.batch_size, ddp_world_size, 
+        t.train(training_steps, train_dl, is_master, is_local_master, device, args.batch_size, ddp_world_size, 
                 num_images_inference = args.num_images_inference, 
                 num_generated_rows = args.num_rows_inference)
         
@@ -583,9 +609,9 @@ if __name__ == "__main__":
                     network_capacity = args.network_capacity, 
                     max_features = args.max_filters, 
                     fir_filter = args.fir_filter_sampling,
-                    use_tanh_last = args.gen_use_tanh_last).to(device)
+                    use_tanh_last = args.gen_use_tanh_last,
+                    rgb_out_channels = args.images_in_channels).to(device)
         
-
         d = Discriminator(args.target_res, args.images_in_channels, 
                         network_capacity = args.network_capacity,
                         max_features = args.max_filters,
@@ -601,10 +627,8 @@ if __name__ == "__main__":
             d = DistributedDataParallel(d, device_ids = [0])
 
         train_dataset = Dataset(args.path_train)
-        eval_dataset = Dataset(args.path_eval)
 
         train_dl = get_data_loader(train_dataset, args.batch_size, ddp, pin_memory = "cuda" in device)
-        eval_dl = get_data_loader(eval_dataset, args.batch_size, ddp, pin_memory = "cuda" in device)
         
         t = Trainer(mn, g, d, args.model_dir, args.target_res,
                     loss_type = args.loss_type, 
@@ -617,14 +641,15 @@ if __name__ == "__main__":
                     style_mixing_prob_inference = args.style_mixing_probs_inference,
                     truncation_psi_inference = args.truncation_psis_inference,
                     disc_optim_steps = args.disc_optim_steps,
-                    w_estimate_samples = args.w_estimate_samples)
+                    w_estimate_samples = args.w_estimate_samples,
+                    save_total_limit = args.save_total_limit)
         
         training_steps = args.training_steps
 
         if args.target_num_images is not None:
             training_steps = int(args.target_num_images / (ddp_world_size * args.batch_size * args.grad_accum))
 
-        t.train(training_steps, train_dl, eval_dl, is_master, is_local_master, device, args.batch_size, ddp_world_size, 
+        t.train(training_steps, train_dl, is_master, is_local_master, device, args.batch_size, ddp_world_size, 
                 num_images_inference = args.num_images_inference,
                 num_generated_rows = args.num_rows_inference)
 

@@ -116,20 +116,4 @@ class PathLengthPenalty(torch.nn.Module):
         self.a.copy_(a.detach())
         res = self.reg_weight * ((gnorm - a) ** 2).mean() # Monte-Carlo estimate of Equation (4) from StyleGAN2 paper.
         self.steps += 1
-        return res
-
-class FID(torch.nn.Module):
-    def __init__(self, device):
-        super().__init__()
-        self.device = device
-        self.inception_v3 = torchvision.models.inception_v3(weights = torchvision.models.Inception_V3_Weights.DEFAULT).to(device).eval()
-        # Replace final fully connected layer with identity mapping to obtain feature maps from last convolutional layer
-        self.inception_v3.fc = torch.nn.Identity()
-        self.resize = torchvision.transforms.Resize((299, 299)) # InceptionV3 expects input tensors of chape 3 x 299 x 299. Currently no support for RGBA it looks like.
-
-    @torch.no_grad
-    # TODO: Put FID aside for now, come back later. Think about incremental statistics, otherwise too much memory will be consumed.
-    def forward(self, mapping_network, generator, eval_loader : torch.utils.data.DataLoader) -> float:
-        X = self.resize(next(iter(eval_loader)).to(self.device))
-        y = self.inception_v3(X)
-        
+        return res        

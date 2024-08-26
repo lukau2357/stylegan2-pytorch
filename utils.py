@@ -1,10 +1,35 @@
 import torch
 import math
 import numpy as np
+import os
+import json
 
 from typing import List, Union, Tuple
 from torch.nn.parallel import DistributedDataParallel
 from dataset import Dataset
+
+def find_label(root_path, metric, compare_operator, assume_first = True):
+    res_label, res_metric = None, None
+    
+    for label in os.listdir(root_path):
+        try:
+            with open(os.path.join(root_path, label, ".metadata.json"), "r", encoding = "utf-8") as f:
+                local_data = json.load(f)
+
+            if assume_first and res_metric is None:
+                res_label = label
+                res_metric = local_data[metric]
+                continue
+
+            if metric in local_data and compare_operator(local_data[metric], res_metric):
+                res_label = label
+                res_metric = local_data[metric]
+
+        except Exception as e:
+            continue
+    
+    # Warning log: res_label is None
+    return res_label
 
 def style_mixing(mapping_network, num_ws : int, num_samples : int, device : str, style_mixing_prob : float, 
                  update_w_ema : bool = True, truncation_psi : float = 1, w_mean : Union[None, torch.Tensor] = None):
@@ -47,7 +72,6 @@ def samples_to_grid(samples : torch.Tensor, num_rows : int) -> np.ndarray:
 def generate_samples(
         generator, 
         mapping_network, 
-        target_resolution : int, 
         device : str, 
         num_samples : int,
         style_mixing_prob : float = 0.9,
@@ -56,6 +80,7 @@ def generate_samples(
         num_generated_rows : int = 1,
         w_estimate_samples : int = 20000):
     
+    target_resolution = generator.module.image_size if isinstance(generator, DistributedDataParallel) else generator.image_size
     estimate_w = mapping_network.module.estimate_w if isinstance(mapping_network, DistributedDataParallel) else mapping_network.estimate_w
     w_mean = None
 
@@ -74,7 +99,3 @@ def generate_samples(
         
     fake_samples = generator(w, generate_noise(target_resolution, num_samples, device))
     return samples_to_grid(fake_samples, num_generated_rows)
-
-def fid_activations_path(path, model, device, batch_size : int = 32):
-    acts = []
-
