@@ -10,10 +10,9 @@ import csv
 
 from model import Generator, Discriminator, MappingNetwork
 from dataset import Dataset, get_data_loader
-from typing import Union, Tuple, Type, List
+from typing import Union, Type, List
 from utils import generate_noise, generate_samples, style_mixing, find_label
 from PIL import Image
-from losses import FID
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel
 from contextlib import contextmanager
@@ -264,9 +263,9 @@ class Trainer:
         with open(os.path.join(path, ".metadata.json"), "w+", encoding = "utf-8") as f:
             json.dump(self.__local_metadata_dict(), f, indent = 4)
         
-        torch.save(self.MN.to_dict(state_dict = True), os.path.join(path, "MN.pth"))
-        torch.save(self.G.to_dict(state_dict = True), os.path.join(path, "G.pth"))
-        torch.save(self.D.to_dict(state_dict = True), os.path.join(path, "D.pth"))
+        torch.save(self.__get_raw_model(self.MN).to_dict(state_dict = True), os.path.join(path, "MN.pth"))
+        torch.save(self.__get_raw_model(self.G).to_dict(state_dict = True), os.path.join(path, "G.pth"))
+        torch.save(self.__get_raw_model(self.D).to_dict(state_dict = True), os.path.join(path, "D.pth"))
         torch.save(self.optim_MN.state_dict(), os.path.join(path, "MN_optimizer.pth"))
         torch.save(self.optim_G.state_dict(), os.path.join(path, "G_optimizer.pth"))
         torch.save(self.optim_D.state_dict(), os.path.join(path, "D_optimizer.pth"))
@@ -431,7 +430,8 @@ class Trainer:
               batch_size : int, 
               world_size : int, 
               num_images_inference : int = 16, 
-              num_generated_rows : int = 1):
+              num_generated_rows : int = 1,
+              sample_every : int = 1):
         
         if is_master:
             if not os.path.exists(self.root_path):
@@ -466,7 +466,7 @@ class Trainer:
             self.__ema_generator_step(device)
             
             if self.g_steps % self.save_every == 0 or self.g_steps == total_steps:
-                if self.save_total_limit == len(self.save_history):
+                if self.save_total_limit == len(self.save_history) and len(self.save_history) > 0:
                     target_steps = self.save_history[0]
                     target_label = find_label(self.root_path, "g_steps", lambda x, y : x == target_steps, assume_first = False)
 
@@ -478,8 +478,7 @@ class Trainer:
                 self.save_history.append(self.g_steps)
                 self.__create_checkpoint(f"checkpoint_{self.g_steps}")
 
-                # TODO: Sampling only for now, incorporate FID computation
-                # Also save which combination of psi and style mixing probability gave best FID score
+            if self.g_steps % sample_every == 0 or self.g_steps == total_steps:
                 with torch.no_grad():
                     for i, psi in enumerate(self.truncation_psi_inference):
                         for j, smp in enumerate(self.style_mixing_prob_inference):
@@ -500,8 +499,11 @@ class Trainer:
                                                             w_estimate_samples = self.w_estimate_samples)
                                 
                             Image.fromarray(current_samples, mode = "RGB").save(os.path.join(self.root_path, "samples", f"current_samples_{self.g_steps}_{i}{j}.jpg"))
+
             pbar.update(1)
-        pbar.close()
+        
+        if pbar is not None:
+            pbar.close()
 
 def parse_args():
     parser = argparse.ArgumentParser(formatter_class = argparse.ArgumentDefaultsHelpFormatter)
@@ -548,7 +550,8 @@ def parse_args():
     parser.add_argument("--w_estimate_samples", type = int, default = 20000, help = "Number of samples taken from multivariate standard Normal distribution to use to estimate average style vector for truncation, in case --no_w_ema is turned on")
     parser.add_argument("--specific_checkpoint", type = str, default = None, help = "Continue training from specific specific checkpoint inside moedl_dir")
     parser.add_argument("--best_fid", type = bool, nargs = "?", default = False, const = True, help = "Continue training from checkpoint with best FID")
-    parser.add_argument("--save_total_limit", type = int, default = 1, help = "Specifies number of model checkpoints that should be rotated")
+    parser.add_argument("--save_total_limit", type = int, default = 1, help = "Specifies number of model checkpoints that should be rotated. Non-positive value results in no limits")
+    parser.add_argument("--sample_every", type = int, default = 1, help = "Generate samples every sample_every steps during training, not related to FID just representative of training")
     args = parser.parse_args()
     return args
 
@@ -564,8 +567,7 @@ if __name__ == "__main__":
         ddp_rank = int(os.environ['RANK'])
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
         ddp_world_size = int(os.environ['WORLD_SIZE'])
-        # device = f'cuda:{ddp_local_rank}' # TODO: Uncomment and remove bottom line when local testing is done
-        device = "cuda:0"
+        device = f'cuda:{ddp_local_rank}' # TODO: Uncomment and remove bottom line when local testing is done
         torch.cuda.set_device(device)
         is_master = ddp_rank == 0
         is_local_master = ddp_local_rank == 0
@@ -597,7 +599,8 @@ if __name__ == "__main__":
 
         t.train(training_steps, train_dl, is_master, is_local_master, device, args.batch_size, ddp_world_size, 
                 num_images_inference = args.num_images_inference, 
-                num_generated_rows = args.num_rows_inference)
+                num_generated_rows = args.num_rows_inference,
+                sample_every = args.sample_every)
         
     else:
         mn = MappingNetwork(args.latent_dim, args.mn_depth, 
@@ -651,7 +654,8 @@ if __name__ == "__main__":
 
         t.train(training_steps, train_dl, is_master, is_local_master, device, args.batch_size, ddp_world_size, 
                 num_images_inference = args.num_images_inference,
-                num_generated_rows = args.num_rows_inference)
+                num_generated_rows = args.num_rows_inference,
+                sample_every = args.sample_every)
 
     if ddp:
         destroy_process_group()
