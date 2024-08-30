@@ -98,39 +98,3 @@ def get_data_loader(dataset : Dataset, batch_size : int, is_ddp : bool, pin_memo
 def get_inception_data_loader(dataset : Dataset, batch_size : int, pin_memory : bool = False, num_workers : int = 0):
     # No shuffling for inception data loader to avoid non-deterministic FID due to floating point associativity issues
     return torch.utils.data.DataLoader(dataset, batch_size = batch_size, shuffle = False, collate_fn = lambda x: torch.stack(x, dim = 0), pin_memory = pin_memory, num_workers = num_workers)
-
-if __name__ == "__main__":
-    '''
-    with open("./list_eval_partition.csv", "r", encoding = "utf-8") as f:
-        csv_file = csv.reader(f)
-        next(csv_file, None) # skip header
-        train_count, test_count, eval_count = 0, 0, 0
-        train_labels, test_labels, eval_labels = [], [], []
-
-        for line in csv_file:
-            set_id = int(line[1])
-
-            if set_id == 0:
-                train_count += 1
-                train_labels.append(line[0])
-
-            elif set_id == 1:
-                test_count += 1
-                test_labels.append(line[0])
-
-            else:
-                eval_count += 1
-                eval_labels.append(line[0])
-        
-        print(f"Train count: {train_count} Test count: {test_count} Eval count: {eval_count}")
-    '''
-
-    '''
-    preprocess(128, os.path.join("img_align_celeba", "img_align_celeba"), "celeba_128_train", train_labels + test_labels)
-    preprocess(128, os.path.join("img_align_celeba", "img_align_celeba"), "celeba_128_eval", eval_labels)    
-
-    print(len(os.listdir("celeba_128_train")))
-    print(len(os.listdir("celeba_128_eval")))
-    print(len(train_labels + test_labels))
-    print(len(eval_labels))
-    '''

@@ -1,4 +1,3 @@
-# Generated with pipreqs
 matplotlib==3.9.2
 numpy==2.1.0
 Pillow==10.4.0

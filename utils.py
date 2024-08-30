@@ -45,7 +45,7 @@ def style_mixing(mapping_network, num_ws : int, num_samples : int, device : str,
         # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/d72cc7d041b42ec8e806021a205ed9349f87c6a4/training/loss.py#L45
         w[cutoff:] = mapping_network(torch.randn_like(z), update_w_ema = False, truncation_psi = truncation_psi, w_mean_estimate = w_mean).unsqueeze(0).repeat(num_ws - cutoff, 1, 1)
 
-    # TODO: Return tuple, obtained style mixes, style vectors that generated the mixes, and cutoff point
+    # TODO: Return tuple, obtained style mixes, style vectors that generated the mixes, and cutoff point?
     return w, None, None
 
 def generate_noise(target_resolution : int, batch_size : int, device : str) -> List[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
@@ -90,7 +90,7 @@ def generate_samples(
     if not estimate_w:
         z = torch.randn((w_estimate_samples, latent_dim), device = device)
         w_mean = mapping_network(z).mean(dim = 0)
-        del z # Free memory?
+        del z
 
     w, _, _ = style_mixing(mapping_network, num_ws, num_samples, device, style_mixing_prob,
                            update_w_ema = update_w_ema,

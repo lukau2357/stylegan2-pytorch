@@ -47,7 +47,7 @@ def plot_metrics(dir):
         metric_count += 1
     
     plt.style.use("ggplot")
-    plot_data(d_adv_loss, f"Discriminator Step. Discriminator optim steps: {metadata['disc_optim_steps']}", "Average Discriminator Adversarial Loss", os.path.join(dir, "d_adversarial_loss.png"))
+    plot_data(d_adv_loss, f"Discriminator Step", "Discriminator Adversarial Loss", os.path.join(dir, "d_adversarial_loss.png"))
     plot_data(g_adv_loss, "Generator Step", "Generator Adversarial Loss", os.path.join(dir, "g_adversarial_loss.png"))
     
     if g_plr is not None:

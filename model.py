@@ -571,7 +571,6 @@ class Discriminator(torch.nn.Module):
             DiscriminatorBlock(self.filters[i], self.filters[i + 1], fir_filter = fir_filter) for i in range(len(self.filters) - 1)
         ])
 
-        # TODO: Last resolution hardcoded to 4, perhaps make it dynamic somehow?
         self.last = DiscriminatorEpilogue(self.filters[-1], 4, use_mbstd = use_mbstd, mbstd_group_size = mbstd_group_size, mbstd_num_channels = mbstd_num_channels)
     
     def to_dict(self, state_dict : bool = False) -> dict:
@@ -616,18 +615,3 @@ class Discriminator(torch.nn.Module):
         X = self.from_rgb(X)
         X = self.disc_blocks(X)
         return self.last(X)
-    
-if __name__ == "__main__":
-    import os
-    mn_d = torch.load(os.path.join("another_test", "last_checkpoint", "MN.pth"))
-    g_d = torch.load(os.path.join("another_test", "last_checkpoint", "G.pth"))
-
-    device = "cuda"
-    MN = MappingNetwork.from_dict(mn_d).to(device)
-    G = Generator.from_dict(g_d).to(device)
-
-    from utils import generate_samples
-
-    imgs = generate_samples(G, MN, device, 16, style_mixing_prob = 0, num_generated_rows = 4)
-    from PIL import Image
-    Image.fromarray(imgs, mode = "RGB").show()

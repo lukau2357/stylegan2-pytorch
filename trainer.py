@@ -26,14 +26,6 @@ def maybe_no_sync(module, condition):
     else:
         yield
 
-
-'''
-              batch_size : int, 
-              num_images_inference : int = 16, 
-              num_generated_rows : int = 1,
-              sample_every : int = 1
-'''
-# For now, supports only single GPU training. Also, no gradient accumulation, for now.
 class Trainer:
     def __init__(self,
         MN : Union[MappingNetwork, DistributedDataParallel], # Mapping network component of generator, None if running from pretrained
@@ -324,7 +316,7 @@ class Trainer:
                         fake_samples = self.G(ws, generate_noise(self.target_resolution, batch_size, device))
                         current_gp_loss = (self.D_gp(real_samples, real_pred = None, fake_samples = fake_samples, critic = self.D) / self.grad_accum_steps) * self.lazy_reg_steps_discriminator
                     
-                    gp_loss += current_gp_loss
+                    gp_loss += current_gp_loss.item()
                 
                 # Account for world_size when doing backward
                 current_loss = (current_d_loss + current_gp_loss) / world_size
@@ -353,7 +345,7 @@ class Trainer:
                 current_g_loss = self.G_loss(fake_pred) / self.grad_accum_steps
                 current_plr_loss = 0
 
-                g_loss += current_g_loss
+                g_loss += current_g_loss.item()
 
                 # Apparently path length regularization uses new fake samples from generator
                 # https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/training/loss.py#L77
@@ -361,7 +353,7 @@ class Trainer:
                     ws, _, _ = style_mixing(self.MN, self.__get_raw_model(self.G).num_layers * 2, batch_size, device, self.style_mixing_prob)
                     fake_samples = self.G(ws, generate_noise(self.target_resolution, batch_size, device))
                     current_plr_loss = (self.G_plr(ws, fake_samples)  / self.grad_accum_steps) * self.lazy_reg_steps_generator
-                    plr_loss += current_plr_loss
+                    plr_loss += current_plr_loss.item()
                 
                 current_loss = (current_g_loss + current_plr_loss) / world_size
                 current_loss.backward()
@@ -411,17 +403,17 @@ class Trainer:
 
         for _ in range(self.disc_optim_steps):
             l, r = self.__discriminator_step(world_size, batch_size, train_loader, device)
-            disc_losses.append(float(l))
+            disc_losses.append(l)
             
             # If previous iteration was for regularization
             if self.d_steps % self.lazy_reg_steps_discriminator == 0:
-                disc_regs.append(float(r))
+                disc_regs.append(r)
             
         l, r = self.__generator_step(world_size, batch_size, device)
 
         if is_local_master:
-            pbar.set_postfix({"G loss": float(l), 
-                            "G PLR": float(r), 
+            pbar.set_postfix({"G loss": l, 
+                            "G PLR": r, 
                             "D loss avg": sum(disc_losses) / len(disc_losses), 
                             "D GP avg": sum(disc_regs) / len(disc_regs) if len(disc_regs) > 0 else 0})
 
@@ -432,10 +424,10 @@ class Trainer:
             for d_reg in disc_regs:
                 self.__write_csv("d_gp.csv", d_reg)
             
-            self.__write_csv("g_adversarial_loss.csv", float(l))
+            self.__write_csv("g_adversarial_loss.csv", l)
 
             if self.g_steps % self.lazy_reg_steps_generator == 0:
-                self.__write_csv("g_plr.csv", float(r))
+                self.__write_csv("g_plr.csv", r)
             
     def train(self, 
               total_steps : int, 
@@ -478,16 +470,18 @@ class Trainer:
             self.__ema_generator_step(device)
             
             if self.g_steps % self.save_every == 0 or self.g_steps == total_steps:
-                if self.save_total_limit == len(self.save_history) and len(self.save_history) > 0:
-                    target_steps = self.save_history[0]
-                    target_label = find_label(self.root_path, "g_steps", lambda x, y : x == target_steps, assume_first = False)
+                if self.save_total_limit > 0:
+                    if self.save_total_limit == len(self.save_history):
+                        target_steps = self.save_history[0]
+                        target_label = find_label(self.root_path, "g_steps", lambda x, y : x == target_steps, assume_first = False)
 
-                    if target_label is not None:
-                        shutil.rmtree(os.path.join(self.root_path, target_label))
+                        if target_label is not None:
+                            shutil.rmtree(os.path.join(self.root_path, target_label))
 
-                    self.save_history.pop(0)
-                
+                        self.save_history.pop(0)
+
                     self.save_history.append(self.g_steps)
+
                 self.__create_checkpoint(f"checkpoint_{self.g_steps}")
 
             if self.g_steps % self.sample_every == 0 or self.g_steps == total_steps:
@@ -500,7 +494,8 @@ class Trainer:
                                                                 style_mixing_prob = smp,
                                                                 truncation_psi = psi,
                                                                 num_generated_rows = self.num_generated_rows,
-                                                                w_estimate_samples = self.w_estimate_samples)
+                                                                w_estimate_samples = self.w_estimate_samples,
+                                                                update_w_ema = False)
                                     
                                 Image.fromarray(ema_samples, mode = "RGB").save(os.path.join(self.root_path, "samples", f"ema_samples_{self.g_steps}_{i}{j}.jpg"))
 
@@ -508,7 +503,8 @@ class Trainer:
                                                             style_mixing_prob = smp,
                                                             truncation_psi = psi,
                                                             num_generated_rows = self.num_generated_rows,
-                                                            w_estimate_samples = self.w_estimate_samples)
+                                                            w_estimate_samples = self.w_estimate_samples,
+                                                            update_w_ema = False)
                                 
                             Image.fromarray(current_samples, mode = "RGB").save(os.path.join(self.root_path, "samples", f"current_samples_{self.g_steps}_{i}{j}.jpg"))
 
@@ -538,7 +534,6 @@ def parse_args():
     parser.add_argument("--style_mixing_prob", type = float, default = 0.9, help = "Style mixing probability to use during training")
     parser.add_argument("--gen_ema_beta", type = float, default = 0.999, help = "Decay coefficient for EMA of mapping network and generator weights")
     parser.add_argument("--ema_steps_threshold", type = int, default = 3000, help = "Compute EMA of mapping network and generator weights only after ema-steps-threshold training steps")
-    # TODO: Add formula for how network-capacity affects number of filters
     parser.add_argument("--network_capacity", type = int, default = 8, help = "Multiplicative factor for number of filters in generator and discriminator. Number of features maps for generator layer that generates images of resolution 2^k is obtained as f(k) = min(max_filters, network_capacity * 2^(log_2(target_res) - k + 1)), and similarly for discriminator layer that processes resolution 2^k has h(k) = min(max_filters, network_capacity * 2^(k - 1)). ")
     parser.add_argument("--gen_use_tanh_last", type = bool, default = False, help = "Use tanh in the last layer of generator to keep images in [-1, 1]. StyleGAN2 paper does not use this in the last layer")
     parser.add_argument("--disc_use_mbstd", type = bool, default = True, help = "Use minibatch-std in last layer of discriminator")
@@ -611,7 +606,7 @@ if __name__ == "__main__":
         mn = MappingNetwork(args.latent_dim, args.mn_depth, 
                             lr_mul = args.mlp_lr_mul, 
                             estimate_w = not args.no_w_ema,
-                            w_ema_beta = args.w_ema_beta,).to(device)
+                            w_ema_beta = args.w_ema_beta).to(device)
         
         g = Generator(args.target_res, args.latent_dim, 
                     network_capacity = args.network_capacity, 
