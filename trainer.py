@@ -207,6 +207,9 @@ class Trainer:
                 res.MNE = MNE
                 res.GE = GE
 
+            if kwargs_metadata["use_plr"]:
+                res.G_plr.load_state_dict(torch.load(os.path.join(checkpoint_path, "G_plr.pth"), weights_only = True))
+
             return res
                 
         target_label = find_label(root_path, "g_steps", lambda x, y : x > y)
@@ -281,6 +284,9 @@ class Trainer:
         if self.MNE is not None:
             torch.save(self.__get_raw_model(self.MNE).to_dict(state_dict = True), os.path.join(path, "MNE.pth"))
             torch.save(self.__get_raw_model(self.G).to_dict(state_dict = True), os.path.join(path, "GE.pth"))
+        
+        if self.use_plr:
+            torch.save(self.G_plr.state_dict(), os.path.join(path, "G_plr.pth"))
         
     def __discriminator_step(self, world_size : int, batch_size : int, train_loader : torch.utils.data.DataLoader, device : str):
         self.optim_D.zero_grad()
@@ -456,6 +462,8 @@ class Trainer:
             
             if self.use_plr:
                 self.__create_csv("g_plr.csv", "path_length_regularization")
+                self.G_plr = self.G_plr.to(device) # Transfer gradient EMA to same device
+                print(f"Initial value: {self.G_plr.a.data}")
 
         pbar = None
         if is_local_master:

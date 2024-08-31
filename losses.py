@@ -74,6 +74,7 @@ class PathLengthPenalty(torch.nn.Module):
         self.reg_weight = reg_weight
         self.beta = beta
         self.steps = 0
+        self.a = torch.nn.Parameter(torch.zeros([]), requires_grad = False)
     
     def forward(self, w : torch.Tensor, x : torch.Tensor):
         """
@@ -82,11 +83,7 @@ class PathLengthPenalty(torch.nn.Module):
         """
         rh, rw = x.shape[2], x.shape[3]
         device = x.device
-
-        # Path length deviation parameter, kept as a EMA, as discussed in the paper. If not initialized, set to 0
-        if not hasattr(self, "a"):
-            self.a = torch.zeros([], device = device, requires_grad = False)
-
+        
         """
         Following is not mentioned in the paper but is present in StyleGAN2-ADA implementation.
         StyleGAN2 TensorFlow implementation: https://github.com/NVlabs/stylegan2/blob/master/training/loss.py#L167

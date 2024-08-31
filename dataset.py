@@ -5,12 +5,10 @@ import torch
 import torchvision
 import torch
 import numpy as np
-import csv
 
 from PIL import Image
 from typing import Union, List
 from torch.utils.data.distributed import DistributedSampler
-from torchvision import transforms
 
 def preprocess(img_size, source_dir : str, target_dir : str, allowed_labels : List[str], center_crop_size : Union[float, None] = None, alpha : float = 1):
     """
@@ -42,7 +40,7 @@ def preprocess(img_size, source_dir : str, target_dir : str, allowed_labels : Li
             image.save(os.path.join(target_dir, label))
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, path : str, alpha : float = 1, is_inception : bool = False):
+    def __init__(self, path : str, alpha : float = 1):
         """
         Constructor for custom RGB image Dataset class. 
         path - Name of the directory that contains images, preferably resized to a power of 2. Path should be given relative to cwd.
@@ -52,23 +50,13 @@ class Dataset(torch.utils.data.Dataset):
         self.alpha = alpha
         self.imgs = [os.path.join(path, item) for item in os.listdir(self.path)]
         self.imgs = self.imgs[:int(len(self.imgs) * alpha)]
-        self.is_inception = is_inception
-        
-        # https://pytorch.org/hub/pytorch_vision_inception_v3/
-        if is_inception:
-            self.transforms = transforms.Compose([
-                transforms.Resize(299),
-                transforms.CenterCrop(299),
-                transforms.Normalize(mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225])
-            ])
 
     def __len__(self):
         return len(self.imgs)
 
     def __getitem__(self, idx) -> torch.Tensor:
-        res = torch.tensor(np.asarray(Image.open(self.imgs[idx])).transpose((2, 0, 1)).astype(np.float32))
-        return self.transforms(res / 255.0) if self.is_inception else res
-    
+        return torch.tensor(np.asarray(Image.open(self.imgs[idx])).transpose((2, 0, 1)).astype(np.float32))
+        
 def get_data_loader(dataset : Dataset, batch_size : int, is_ddp : bool, pin_memory : bool = True, num_workers : int = 0):
     if is_ddp:
         dl = torch.utils.data.DataLoader(
