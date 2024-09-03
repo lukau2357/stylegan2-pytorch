@@ -210,13 +210,16 @@ class Trainer:
             if kwargs_metadata["use_plr"]:
                 res.G_plr.load_state_dict(torch.load(os.path.join(checkpoint_path, "G_plr.pth"), weights_only = True))
 
+            print(f"Found model checkpoint at {checkpoint_path}.")
+            print(f"Global metadata: {json.dump(global_metadata, indent = 4)}")
+            print(f"Checkpoint metadata: {json.dump(local_metadata, indent = 4)}")
             return res
                 
         target_label = find_label(root_path, "g_steps", lambda x, y : x > y)
         assert target_label is not None, f"No valid model checkpoint fount in {root_path}"
         return from_checkpoint(root_path, target_label)
                 
-    def __global_metadata_dict(self) -> dict:
+    def global_metadata_dict(self) -> dict:
         d = {
             "target_resolution": self.target_resolution,
             "loss_type": self.loss_type,
@@ -295,7 +298,7 @@ class Trainer:
         d_loss, gp_loss = 0, 0
 
         for i in range(self.grad_accum_steps):
-            with maybe_no_sync(self.D, i == self.grad_accum_steps - 1):
+            with maybe_no_sync(self.D, i < self.grad_accum_steps - 1):
                 real_samples = next(train_loader).to(device)
                 # Potential gradient penalty computation
                 real_samples.requires_grad_(should_reg)
@@ -325,7 +328,10 @@ class Trainer:
                     gp_loss += current_gp_loss.item()
                 
                 # Account for world_size when doing backward
-                current_loss = (current_d_loss + current_gp_loss) / world_size
+                # Looks like scaling by 1 / world_size might not be neccesary?
+                # https://discuss.pytorch.org/t/averaging-gradients-in-distributeddataparallel/74840
+                # Same goes for generator step, try like this for now
+                current_loss = (current_d_loss + current_gp_loss)
                 current_loss.backward()
 
         self.optim_D.step()
@@ -343,7 +349,7 @@ class Trainer:
         g_loss, plr_loss = 0, 0
 
         for i in range(self.grad_accum_steps):
-            with maybe_no_sync(self.G, i == self.grad_accum_steps - 1), maybe_no_sync(self.MN, i == self.grad_accum_steps - 1):
+            with maybe_no_sync(self.G, i < self.grad_accum_steps - 1), maybe_no_sync(self.MN, i < self.grad_accum_steps - 1):
                 ws, _, _ = style_mixing(self.MN, self.__get_raw_model(self.G).num_layers * 2, batch_size, device, self.style_mixing_prob)
                 fake_samples = self.G(ws, generate_noise(self.target_resolution, batch_size, device))
                 fake_pred = self.D(fake_samples)
@@ -361,7 +367,7 @@ class Trainer:
                     current_plr_loss = (self.G_plr(ws, fake_samples)  / self.grad_accum_steps) * self.lazy_reg_steps_generator
                     plr_loss += current_plr_loss.item()
                 
-                current_loss = (current_g_loss + current_plr_loss) / world_size
+                current_loss = (current_g_loss + current_plr_loss)
                 current_loss.backward()
 
         self.optim_MN.step()
@@ -443,6 +449,9 @@ class Trainer:
               device : str,
               world_size : int):
         
+        if self.use_plr:
+            self.G_plr = self.G_plr.to(device) # Transfer gradient EMA to same device
+
         if is_master:
             if not os.path.exists(self.root_path):
                 os.mkdir(self.root_path)
@@ -452,7 +461,7 @@ class Trainer:
                 os.mkdir(os.path.join(self.root_path, "samples"))
 
             with open(os.path.join(self.root_path, ".metadata.json"), "w+", encoding = "utf-8") as f:
-                json.dump(self.__global_metadata_dict(), f, indent = 4)
+                json.dump(self.global_metadata_dict(), f, indent = 4)
         
             self.__create_csv("d_adversarial_loss.csv", "adversarial_loss")
             self.__create_csv("g_adversarial_loss.csv", "adversarial_loss")
@@ -462,8 +471,6 @@ class Trainer:
             
             if self.use_plr:
                 self.__create_csv("g_plr.csv", "path_length_regularization")
-                self.G_plr = self.G_plr.to(device) # Transfer gradient EMA to same device
-                print(f"Initial value: {self.G_plr.a.data}")
 
         pbar = None
         if is_local_master:
@@ -563,6 +570,7 @@ def parse_args():
     parser.add_argument("--w_estimate_samples", type = int, default = 20000, help = "Number of samples taken from multivariate standard Normal distribution to use to estimate average style vector for truncation, in case --no_w_ema is turned on")
     parser.add_argument("--save_total_limit", type = int, default = 1, help = "Specifies number of model checkpoints that should be rotated. Non-positive value results in no limits")
     parser.add_argument("--sample_every", type = int, default = 1, help = "Generate samples every sample_every steps during training. These samples are saved under sampled subdirectory in model_dir, and should represent samples generated by model at different stages of training")
+    parser.add_argument("--no_training", type = bool, default = False, nargs = "?", const = True, help = "Creates the model/loads a checkpoint, log metadata without training")
     args = parser.parse_args()
     return args
 
@@ -594,9 +602,20 @@ if __name__ == "__main__":
         ddp_local_rank = 0
         
     torch.manual_seed(args.random_seed + seed_offset)
-
+            
     if args.from_checkpoint:
         t = Trainer.from_trained(args.model_dir, ddp_local_rank, device, ddp, is_master)
+
+        if is_master:
+            print(f"Mapping network number of trainable parameters: {t.MN.count_parameters() if not ddp else t.MN.module.count_parameters()}")
+            print(f"Generator number of trainable parameters: {t.G.count_parameters() if not ddp else t.G.module.count_parameters()}")
+            print(f"Discriminator number of trainable parameters: {t.D.count_parameters() if not ddp else t.D.module.count_parameters()}")
+
+        if args.no_training:
+            if ddp:
+                destroy_process_group()
+            exit(0)
+        
         training_steps = args.training_steps
 
         if args.target_num_images is not None:
@@ -631,6 +650,16 @@ if __name__ == "__main__":
                         mbstd_num_channels = args.mbstd_num_channels,
                         fir_filter = args.fir_filter_sampling).to(device)
         
+        if is_master:
+            print(f"Mapping network number of trainable parameters: {mn.count_parameters()}")
+            print(f"Generator number of trainable parameters: {g.count_parameters()}")
+            print(f"Discriminator number of trainable parameters: {d.count_parameters()}")
+
+        if args.no_training:
+            if ddp:
+                destroy_process_group()
+            exit(0)
+
         if ddp:
             mn = DistributedDataParallel(mn, device_ids = [ddp_local_rank])
             g = DistributedDataParallel(g, device_ids = [ddp_local_rank])
@@ -658,6 +687,8 @@ if __name__ == "__main__":
                     sample_every = args.sample_every)
         
         training_steps = args.training_steps
+
+        print(f"Trainer metadata: {json.dump(t.global_metadata_dict(), indent = 4)}")
 
         if args.target_num_images is not None:
             training_steps = int(args.target_num_images / (ddp_world_size * args.batch_size * args.grad_accum))

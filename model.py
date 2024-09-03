@@ -24,12 +24,11 @@ def leaky_relu(p : float = 0.2, gain : float = 1):
 def get_leaky_relu_gain(p : float = 0.2):
     # return (2 / (1 + p ** 2)) ** 0.5
     return 2 ** 0.5
-    # return 1
 
 class EqualizedWeight(torch.nn.Module):
     """
     Equalized learning rate for all weigts in StyleGAN2 model. Authors reason that standard optimization algorithms like RMSProp or Adam
-    normalize the update by an estimate of gradient's variance, and thus weights with higher variances could take more time to adapt. Instead 
+    normalize the update by an estimate of gradient's second moment, and thus weights with higher variances could take more time to adapt. Instead 
     of performing weight initialization techniques, they divide the weights by Kaiming normalization constant (https://arxiv.org/pdf/1502.01852), 
     attempting to make variances/dynamic ranges (and thus learning speeds) for all weights the same. More can be found in ProGAN paper: https://arxiv.org/pdf/1710.10196. 
     """
@@ -81,8 +80,8 @@ class EqualizedConv2d(torch.nn.Module):
         self.stride = stride
         self.padding = padding
         self.use_bias = use_bias
-
         self.w = EqualizedWeight((out_channels, in_channels, kernel_size, kernel_size), gain = gain)
+
         if self.use_bias:
             self.b = torch.nn.Parameter(torch.ones(out_channels) * bias)
 
@@ -210,7 +209,7 @@ class Conv2dModulation(torch.nn.Module):
         
         if self.demodulate:
             d = torch.rsqrt((w1 ** 2).sum(dim = (2, 3, 4), keepdim = True) + self.eps)
-            w1 = w1 * d # w1 *= d caused in place error modifications for gradient computations in pathe length regularization!!!
+            w1 = w1 * d # w1 *= d caused in place error modifications for gradient computations in path length regularization!!!
 
         res = torch.nn.functional.conv2d(X.reshape(1, -1, h, w), 
                                          w1.reshape(b * self.out_channels, c, self.kernel_size, self.kernel_size), 

@@ -82,7 +82,3 @@ def get_data_loader(dataset : Dataset, batch_size : int, is_ddp : bool, pin_memo
     while True:
         for sample in dl:
             yield sample
-    
-def get_inception_data_loader(dataset : Dataset, batch_size : int, pin_memory : bool = False, num_workers : int = 0):
-    # No shuffling for inception data loader to avoid non-deterministic FID due to floating point associativity issues
-    return torch.utils.data.DataLoader(dataset, batch_size = batch_size, shuffle = False, collate_fn = lambda x: torch.stack(x, dim = 0), pin_memory = pin_memory, num_workers = num_workers)
