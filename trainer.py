@@ -210,9 +210,10 @@ class Trainer:
             if kwargs_metadata["use_plr"]:
                 res.G_plr.load_state_dict(torch.load(os.path.join(checkpoint_path, "G_plr.pth"), weights_only = True))
 
-            print(f"Found model checkpoint at {checkpoint_path}.")
-            print(f"Global metadata: {json.dumps(global_metadata, indent = 4)}")
-            print(f"Checkpoint metadata: {json.dumps(local_metadata, indent = 4)}")
+            if is_master_process:
+                print(f"Found model checkpoint at {checkpoint_path}.")
+                print(f"Global metadata: {json.dumps(global_metadata, indent = 4)}")
+                print(f"Checkpoint metadata: {json.dumps(local_metadata, indent = 4)}")
             return res
                 
         target_label = find_label(root_path, "g_steps", lambda x, y : x > y)
@@ -688,12 +689,13 @@ if __name__ == "__main__":
         
         training_steps = args.training_steps
 
-        print(f"Trainer metadata: {json.dumps(t.global_metadata_dict(), indent = 4)}")
+        if is_master:
+            print(f"Trainer metadata: {json.dumps(t.global_metadata_dict(), indent = 4)}")
 
         if args.target_num_images is not None:
             training_steps = int(args.target_num_images / (ddp_world_size * args.batch_size * args.grad_accum))
 
-        if is_local_master:
+        if is_master:
             print(f"Training freshly initialized model.\nTraining steps based on target_num_images and training_steps parameters: {training_steps}")
             
         t.train(training_steps, train_dl, is_master, is_local_master, device, ddp_world_size)
