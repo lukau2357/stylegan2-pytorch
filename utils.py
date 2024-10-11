@@ -78,7 +78,8 @@ def generate_samples(
         truncation_psi : float = 1.0,
         update_w_ema : bool = False,
         num_generated_rows : int = 1,
-        w_estimate_samples : int = 20000):
+        w_estimate_samples : int = 20000,
+        compute_truncation_base : bool = False):
     
     target_resolution = generator.module.image_size if isinstance(generator, DistributedDataParallel) else generator.image_size
     estimate_w = mapping_network.module.estimate_w if isinstance(mapping_network, DistributedDataParallel) else mapping_network.estimate_w
@@ -86,16 +87,29 @@ def generate_samples(
 
     latent_dim = mapping_network.module.latent_dim if isinstance(mapping_network, DistributedDataParallel) else mapping_network.latent_dim
     num_ws = 2 * generator.module.num_layers if isinstance(generator, DistributedDataParallel) else 2 * generator.num_layers
+    truncation_base = None
 
     if not estimate_w:
         z = torch.randn((w_estimate_samples, latent_dim), device = device)
         w_mean = mapping_network(z).mean(dim = 0)
         del z
-
+    
     w, _, _ = style_mixing(mapping_network, num_ws, num_samples, device, style_mixing_prob,
-                           update_w_ema = update_w_ema,
-                           truncation_psi = truncation_psi,
-                           w_mean = w_mean)
-        
+                            update_w_ema = update_w_ema,
+                            truncation_psi = truncation_psi,
+                            w_mean = w_mean)  
+      
     fake_samples = generator(w, generate_noise(target_resolution, num_samples, device))
-    return samples_to_grid(fake_samples, num_generated_rows)
+    grid = samples_to_grid(fake_samples, num_generated_rows)
+
+    if compute_truncation_base:
+        if estimate_w:
+            w_mean = mapping_network.module.w_ema if isinstance(mapping_network, DistributedDataParallel) else mapping_network.w_ema
+        
+        w_mean = w_mean.unsqueeze(0).repeat(2 * generator.num_layers, 1, 1)
+        truncation_base = generator(w_mean, generate_noise(target_resolution, 1, device))[0]
+        truncation_base = ((truncation_base + 1) * 127.5).cpu().detach().numpy() # Back to (0, 255) with clipping
+        truncation_base = np.rint(truncation_base).clip(0, 255).astype(np.uint8).transpose(1, 2, 0)
+        return grid, truncation_base
+    
+    return grid

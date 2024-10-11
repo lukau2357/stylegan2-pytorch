@@ -26,6 +26,14 @@ def maybe_no_sync(module, condition):
     else:
         yield
 
+'''
+Parameters to be discarded from trainer and integrated in training loop only:
+    save_every
+    num_images_inference
+    num_generated_rows
+    sample_every
+'''
+
 class Trainer:
     def __init__(self,
         MN : Union[MappingNetwork, DistributedDataParallel], # Mapping network component of generator, None if running from pretrained
@@ -50,16 +58,12 @@ class Trainer:
         adam_beta1 : float = 0.0,
         adam_beta2 : float = 0.99,
         adam_eps : float = 1e-8,
-        save_every : int = 1000,    # Create checkpoint every save_every generator steps. Also corresponds to evaluation strategy
         gen_ema_beta : float = 0.999,
         grad_accum_steps : int = 1,
         compute_generator_ema : bool = True,
         ema_steps_threshold : int = 1, # Compute Generator EMA starting from ema_steps_threshold,
         w_estimate_samples : int = 20000,
         save_total_limit : int = 1,
-        num_images_inference : int = 16,
-        num_generated_rows : int = 1,
-        sample_every : int = 1
     ):            
         self.root_path = root_path
         self.target_resolution = target_resolution
@@ -91,15 +95,11 @@ class Trainer:
         if self.use_plr:
             self.G_plr = losses.PathLengthPenalty(reg_weight = pl_weight, beta = pl_beta)
 
-        self.save_every = save_every
         self.gen_ema_beta = gen_ema_beta
         self.compute_generator_ema = compute_generator_ema
         self.ema_steps_threshold = ema_steps_threshold
         self.w_estimate_samples = w_estimate_samples
         self.save_total_limit = save_total_limit
-        self.num_images_inference = num_images_inference
-        self.num_generated_rows = num_generated_rows
-        self.sample_every = sample_every
         self.save_history = []
 
         self.grad_accum_steps = grad_accum_steps
@@ -188,7 +188,14 @@ class Trainer:
             kwargs_metadata.pop("discriminator_params")
             kwargs_metadata.pop("batch_size")
 
-            res = Trainer(MN, G, D, 
+            # TODO: Older instances of Trainer class included these parameters in their metadata, when deserializing with new API these keys would cause an error
+            # This line should be removed once testing/training with old Trainer instances is finished.
+            kwargs_metadata.pop("save_every", None)
+            kwargs_metadata.pop("sample_every", None)
+            kwargs_metadata.pop("num_images_inference", None)
+            kwargs_metadata.pop("num_generated_rows", None)
+
+            res = cls(MN, G, D, 
                           root,
                           global_metadata["target_resolution"],
                           global_metadata["batch_size"],
@@ -239,7 +246,6 @@ class Trainer:
             "adam_beta1": self.adam_beta1,
             "adam_beta2": self.adam_beta2,
             "adam_eps": self.adam_eps,
-            "save_every": self.save_every,
             "gen_ema_beta": self.gen_ema_beta,
             "grad_accum_steps": self.grad_accum_steps,
             "compute_generator_ema": self.compute_generator_ema,
@@ -250,9 +256,6 @@ class Trainer:
             "discriminator_params": self.__get_raw_model(self.D).to_dict(),
             "save_total_limit": self.save_total_limit,
             "batch_size": self.batch_size,
-            "sample_every": self.sample_every,
-            "num_images_inference": self.num_images_inference,
-            "num_generated_rows": self.num_generated_rows
         }
 
         return d
@@ -292,7 +295,7 @@ class Trainer:
         if self.use_plr:
             torch.save(self.G_plr.state_dict(), os.path.join(path, "G_plr.pth"))
         
-    def __discriminator_step(self, world_size : int, batch_size : int, train_loader : torch.utils.data.DataLoader, device : str):
+    def __discriminator_step(self, batch_size : int, train_loader : torch.utils.data.DataLoader, device : str):
         self.optim_D.zero_grad()
         should_reg = self.lazy_reg_steps_discriminator > 0 and (self.d_steps + 1) % self.lazy_reg_steps_discriminator == 0 and self.use_gp
 
@@ -341,7 +344,7 @@ class Trainer:
         return d_loss, gp_loss
 
     # Make private once initial tests are done
-    def __generator_step(self, world_size : int, batch_size : int, device : str):
+    def __generator_step(self, batch_size : int, device : str):
         self.optim_MN.zero_grad()
         self.optim_G.zero_grad()
 
@@ -411,18 +414,18 @@ class Trainer:
                 else:
                     ema_param.copy_(param)
 
-    def __model_step(self, world_size : int, batch_size : int, pbar : tqdm.tqdm, train_loader : torch.utils.data.DataLoader, device : str, is_local_master : bool):
+    def __model_step(self, batch_size : int, pbar : tqdm.tqdm, train_loader : torch.utils.data.DataLoader, device : str, is_local_master : bool):
         disc_losses, disc_regs = [], []
 
         for _ in range(self.disc_optim_steps):
-            l, r = self.__discriminator_step(world_size, batch_size, train_loader, device)
+            l, r = self.__discriminator_step(batch_size, train_loader, device)
             disc_losses.append(l)
             
             # If previous iteration was for regularization
             if self.d_steps % self.lazy_reg_steps_discriminator == 0:
                 disc_regs.append(r)
             
-        l, r = self.__generator_step(world_size, batch_size, device)
+        l, r = self.__generator_step(batch_size, device)
 
         if is_local_master:
             pbar.set_postfix({"G loss": l, 
@@ -448,7 +451,10 @@ class Trainer:
               is_master : bool,
               is_local_master : bool,
               device : str,
-              world_size : int):
+              save_every : int,
+              sample_every : int, 
+              num_images_inference : int,
+              num_generated_rows : int):
         
         if self.use_plr:
             self.G_plr = self.G_plr.to(device) # Transfer gradient EMA to same device
@@ -478,14 +484,14 @@ class Trainer:
             pbar = tqdm.tqdm(total = total_steps, initial = self.g_steps, position = 0, leave = True)
 
         for _ in range(self.g_steps, total_steps):
-            self.__model_step(world_size, self.batch_size, pbar, train_loader, device, is_local_master)
+            self.__model_step(self.batch_size, pbar, train_loader, device, is_local_master)
 
             if not is_master:
                 continue
 
             self.__ema_generator_step(device)
             
-            if self.g_steps % self.save_every == 0 or self.g_steps == total_steps:
+            if self.g_steps % save_every == 0 or self.g_steps == total_steps:
                 if self.save_total_limit > 0:
                     if self.save_total_limit == len(self.save_history):
                         target_steps = self.save_history[0]
@@ -500,25 +506,25 @@ class Trainer:
 
                 self.__create_checkpoint(f"checkpoint_{self.g_steps}")
 
-            if self.g_steps % self.sample_every == 0 or self.g_steps == total_steps:
+            if self.g_steps % sample_every == 0 or self.g_steps == total_steps:
                 with torch.no_grad():
                     for i, psi in enumerate(self.truncation_psi_inference):
                         for j, smp in enumerate(self.style_mixing_prob_inference):
                             # Possible that EMA models don't exist if current g_steps < ema_steps_threshold 
                             if self.MNE is not None:
-                                ema_samples = generate_samples(self.GE, self.MNE, device, self.num_images_inference,
+                                ema_samples = generate_samples(self.GE, self.MNE, device, num_images_inference,
                                                                 style_mixing_prob = smp,
                                                                 truncation_psi = psi,
-                                                                num_generated_rows = self.num_generated_rows,
+                                                                num_generated_rows = num_generated_rows,
                                                                 w_estimate_samples = self.w_estimate_samples,
                                                                 update_w_ema = False)
                                     
                                 Image.fromarray(ema_samples, mode = "RGB").save(os.path.join(self.root_path, "samples", f"ema_samples_{self.g_steps}_{i}{j}.jpg"))
 
-                            current_samples = generate_samples(self.G, self.MN, device, self.num_images_inference,
+                            current_samples = generate_samples(self.G, self.MN, device, num_images_inference,
                                                             style_mixing_prob = smp,
                                                             truncation_psi = psi,
-                                                            num_generated_rows = self.num_generated_rows,
+                                                            num_generated_rows = num_generated_rows,
                                                             w_estimate_samples = self.w_estimate_samples,
                                                             update_w_ema = False)
                                 
@@ -628,7 +634,7 @@ if __name__ == "__main__":
         if is_local_master:
             print(f"Training from latest checkpoint found in {args.model_dir}.\nTraining steps based on target_num_images and training_steps parameteres: {training_steps}")
 
-        t.train(training_steps, train_dl, is_master, is_local_master, device, ddp_world_size)
+        t.train(training_steps, train_dl, is_master, is_local_master, device, args.save_every, args.sample_every, args.num_images_inference, args.num_rows_inference)
         
     else:
         mn = MappingNetwork(args.latent_dim, args.mn_depth, 
@@ -672,7 +678,6 @@ if __name__ == "__main__":
         
         t = Trainer(mn, g, d, args.model_dir, args.target_res, args.batch_size,
                     loss_type = args.loss_type, 
-                    save_every = args.save_every, 
                     learning_rate = args.learning_rate, 
                     grad_accum_steps = args.grad_accum, 
                     style_mixing_prob = args.style_mixing_prob, 
@@ -682,10 +687,7 @@ if __name__ == "__main__":
                     truncation_psi_inference = args.truncation_psis_inference,
                     disc_optim_steps = args.disc_optim_steps,
                     w_estimate_samples = args.w_estimate_samples,
-                    save_total_limit = args.save_total_limit,
-                    num_images_inference = args.num_images_inference,
-                    num_generated_rows = args.num_rows_inference,
-                    sample_every = args.sample_every)
+                    save_total_limit = args.save_total_limit)
         
         training_steps = args.training_steps
 
@@ -698,7 +700,7 @@ if __name__ == "__main__":
         if is_master:
             print(f"Training freshly initialized model.\nTraining steps based on target_num_images and training_steps parameters: {training_steps}")
             
-        t.train(training_steps, train_dl, is_master, is_local_master, device, ddp_world_size)
+        t.train(training_steps, train_dl, is_master, is_local_master, device, args.save_every, args.sample_every, args.num_images_inference, args.num_rows_inference)
 
     if ddp:
         destroy_process_group()
