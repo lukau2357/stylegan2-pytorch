@@ -290,7 +290,7 @@ class Trainer:
         
         if self.MNE is not None:
             torch.save(self.__get_raw_model(self.MNE).to_dict(state_dict = True), os.path.join(path, "MNE.pth"))
-            torch.save(self.__get_raw_model(self.G).to_dict(state_dict = True), os.path.join(path, "GE.pth"))
+            torch.save(self.__get_raw_model(self.GE).to_dict(state_dict = True), os.path.join(path, "GE.pth"))
         
         if self.use_plr:
             torch.save(self.G_plr.state_dict(), os.path.join(path, "G_plr.pth"))
