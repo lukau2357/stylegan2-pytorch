@@ -26,14 +26,6 @@ def maybe_no_sync(module, condition):
     else:
         yield
 
-'''
-Parameters to be discarded from trainer and integrated in training loop only:
-    save_every
-    num_images_inference
-    num_generated_rows
-    sample_every
-'''
-
 class Trainer:
     def __init__(self,
         MN : Union[MappingNetwork, DistributedDataParallel], # Mapping network component of generator, None if running from pretrained
@@ -41,7 +33,6 @@ class Trainer:
         D: Union[Discriminator, DistributedDataParallel], # Discriminator, None if running from pretrained
         root_path : str,
         target_resolution : int,
-        batch_size : int,
         loss_type : str = "vanilla",    # Use vanilla GAN loss or WGAN loss
         use_gp : bool = True,    # Use gradient penalty
         use_plr : bool = True,   # Use path length regularization
@@ -59,7 +50,6 @@ class Trainer:
         adam_beta2 : float = 0.99,
         adam_eps : float = 1e-8,
         gen_ema_beta : float = 0.999,
-        grad_accum_steps : int = 1,
         compute_generator_ema : bool = True,
         ema_steps_threshold : int = 1, # Compute Generator EMA starting from ema_steps_threshold,
         w_estimate_samples : int = 20000,
@@ -67,7 +57,6 @@ class Trainer:
     ):            
         self.root_path = root_path
         self.target_resolution = target_resolution
-        self.batch_size = batch_size
 
         assert loss_type in ["vanilla", "wgan"]
         self.loss_type = loss_type
@@ -102,7 +91,6 @@ class Trainer:
         self.save_total_limit = save_total_limit
         self.save_history = []
 
-        self.grad_accum_steps = grad_accum_steps
         self.disc_optim_steps = disc_optim_steps
         self.lazy_reg_steps_generator = lazy_reg_steps_generator
         self.lazy_reg_steps_discriminator = lazy_reg_steps_discriminator
@@ -186,19 +174,10 @@ class Trainer:
             kwargs_metadata.pop("mapping_network_params")
             kwargs_metadata.pop("generator_params")
             kwargs_metadata.pop("discriminator_params")
-            kwargs_metadata.pop("batch_size")
-
-            # TODO: Older instances of Trainer class included these parameters in their metadata, when deserializing with new API these keys would cause an error
-            # This line should be removed once testing/training with old Trainer instances is finished.
-            kwargs_metadata.pop("save_every", None)
-            kwargs_metadata.pop("sample_every", None)
-            kwargs_metadata.pop("num_images_inference", None)
-            kwargs_metadata.pop("num_generated_rows", None)
 
             res = cls(MN, G, D, 
                           root,
                           global_metadata["target_resolution"],
-                          global_metadata["batch_size"],
                           **kwargs_metadata
                           )
             
@@ -247,7 +226,6 @@ class Trainer:
             "adam_beta2": self.adam_beta2,
             "adam_eps": self.adam_eps,
             "gen_ema_beta": self.gen_ema_beta,
-            "grad_accum_steps": self.grad_accum_steps,
             "compute_generator_ema": self.compute_generator_ema,
             "ema_steps_threshold": self.ema_steps_threshold,
             "w_estimate_samples": self.w_estimate_samples,
@@ -255,7 +233,6 @@ class Trainer:
             "generator_params": self.__get_raw_model(self.G).to_dict(),
             "discriminator_params": self.__get_raw_model(self.D).to_dict(),
             "save_total_limit": self.save_total_limit,
-            "batch_size": self.batch_size,
         }
 
         return d
@@ -295,14 +272,14 @@ class Trainer:
         if self.use_plr:
             torch.save(self.G_plr.state_dict(), os.path.join(path, "G_plr.pth"))
         
-    def __discriminator_step(self, batch_size : int, train_loader : torch.utils.data.DataLoader, device : str):
+    def __discriminator_step(self, batch_size : int, grad_accum_steps : int, train_loader : torch.utils.data.DataLoader, device : str):
         self.optim_D.zero_grad()
         should_reg = self.lazy_reg_steps_discriminator > 0 and (self.d_steps + 1) % self.lazy_reg_steps_discriminator == 0 and self.use_gp
 
         d_loss, gp_loss = 0, 0
 
-        for i in range(self.grad_accum_steps):
-            with maybe_no_sync(self.D, i < self.grad_accum_steps - 1):
+        for i in range(grad_accum_steps):
+            with maybe_no_sync(self.D, i < grad_accum_steps - 1):
                 real_samples = next(train_loader).to(device)
                 # Potential gradient penalty computation
                 real_samples.requires_grad_(should_reg)
@@ -312,7 +289,7 @@ class Trainer:
                 fake_samples = self.G(ws, generate_noise(self.target_resolution, batch_size, device)).detach() # Detach generator from computational graph
                 fake_pred = self.D(fake_samples)
 
-                current_d_loss = self.D_loss(real_pred, fake_pred) / self.grad_accum_steps
+                current_d_loss = self.D_loss(real_pred, fake_pred) / grad_accum_steps
                 current_gp_loss = 0
 
                 d_loss += current_d_loss.item()
@@ -321,13 +298,13 @@ class Trainer:
                     # Use R1 gradient penalty for vanilla GAN loss  
                     # Quote from StyleGAN2 paper: "We also multiply the regularization term by k to balance the overall magnitude of its gradients"          
                     if self.loss_type == "vanilla":
-                        current_gp_loss = (self.D_gp(real_samples, real_pred) / self.grad_accum_steps) * self.lazy_reg_steps_discriminator
+                        current_gp_loss = (self.D_gp(real_samples, real_pred) / grad_accum_steps) * self.lazy_reg_steps_discriminator
 
                     # For WGAN loss we use GP penalty, norm deviations from 1 and fake/real interpolation
                     else:
                         ws, _, _ = style_mixing(self.MN, self.__get_raw_model(self.G).num_layers * 2, batch_size, device, self.style_mixing_prob)
                         fake_samples = self.G(ws, generate_noise(self.target_resolution, batch_size, device))
-                        current_gp_loss = (self.D_gp(real_samples, real_pred = None, fake_samples = fake_samples, critic = self.D) / self.grad_accum_steps) * self.lazy_reg_steps_discriminator
+                        current_gp_loss = (self.D_gp(real_samples, real_pred = None, fake_samples = fake_samples, critic = self.D) / grad_accum_steps) * self.lazy_reg_steps_discriminator
                     
                     gp_loss += current_gp_loss.item()
                 
@@ -344,7 +321,7 @@ class Trainer:
         return d_loss, gp_loss
 
     # Make private once initial tests are done
-    def __generator_step(self, batch_size : int, device : str):
+    def __generator_step(self, batch_size : int, grad_accum_steps : int, device : str):
         self.optim_MN.zero_grad()
         self.optim_G.zero_grad()
 
@@ -352,13 +329,13 @@ class Trainer:
 
         g_loss, plr_loss = 0, 0
 
-        for i in range(self.grad_accum_steps):
-            with maybe_no_sync(self.G, i < self.grad_accum_steps - 1), maybe_no_sync(self.MN, i < self.grad_accum_steps - 1):
+        for i in range(grad_accum_steps):
+            with maybe_no_sync(self.G, i < grad_accum_steps - 1), maybe_no_sync(self.MN, i < grad_accum_steps - 1):
                 ws, _, _ = style_mixing(self.MN, self.__get_raw_model(self.G).num_layers * 2, batch_size, device, self.style_mixing_prob)
                 fake_samples = self.G(ws, generate_noise(self.target_resolution, batch_size, device))
                 fake_pred = self.D(fake_samples)
 
-                current_g_loss = self.G_loss(fake_pred) / self.grad_accum_steps
+                current_g_loss = self.G_loss(fake_pred) / grad_accum_steps
                 current_plr_loss = 0
 
                 g_loss += current_g_loss.item()
@@ -368,7 +345,7 @@ class Trainer:
                 if should_reg:
                     ws, _, _ = style_mixing(self.MN, self.__get_raw_model(self.G).num_layers * 2, batch_size, device, self.style_mixing_prob)
                     fake_samples = self.G(ws, generate_noise(self.target_resolution, batch_size, device))
-                    current_plr_loss = (self.G_plr(ws, fake_samples)  / self.grad_accum_steps) * self.lazy_reg_steps_generator
+                    current_plr_loss = (self.G_plr(ws, fake_samples)  / grad_accum_steps) * self.lazy_reg_steps_generator
                     plr_loss += current_plr_loss.item()
                 
                 current_loss = (current_g_loss + current_plr_loss)
@@ -414,18 +391,18 @@ class Trainer:
                 else:
                     ema_param.copy_(param)
 
-    def __model_step(self, batch_size : int, pbar : tqdm.tqdm, train_loader : torch.utils.data.DataLoader, device : str, is_local_master : bool):
+    def __model_step(self, batch_size : int, grad_accum_steps : int, pbar : tqdm.tqdm, train_loader : torch.utils.data.DataLoader, device : str, is_local_master : bool):
         disc_losses, disc_regs = [], []
 
         for _ in range(self.disc_optim_steps):
-            l, r = self.__discriminator_step(batch_size, train_loader, device)
+            l, r = self.__discriminator_step(batch_size, grad_accum_steps, train_loader, device)
             disc_losses.append(l)
             
             # If previous iteration was for regularization
             if self.d_steps % self.lazy_reg_steps_discriminator == 0:
                 disc_regs.append(r)
             
-        l, r = self.__generator_step(batch_size, device)
+        l, r = self.__generator_step(batch_size, grad_accum_steps, device)
 
         if is_local_master:
             pbar.set_postfix({"G loss": l, 
@@ -447,6 +424,8 @@ class Trainer:
             
     def train(self, 
               total_steps : int, 
+              batch_size : int,
+              grad_accum_steps : int,
               train_loader : torch.utils.data.DataLoader, 
               is_master : bool,
               is_local_master : bool,
@@ -484,7 +463,7 @@ class Trainer:
             pbar = tqdm.tqdm(total = total_steps, initial = self.g_steps, position = 0, leave = True)
 
         for _ in range(self.g_steps, total_steps):
-            self.__model_step(self.batch_size, pbar, train_loader, device, is_local_master)
+            self.__model_step(batch_size, grad_accum_steps, pbar, train_loader, device, is_local_master)
 
             if not is_master:
                 continue
@@ -626,15 +605,15 @@ if __name__ == "__main__":
         training_steps = args.training_steps
 
         if args.target_num_images is not None:
-            training_steps = int(args.target_num_images / (ddp_world_size * t.batch_size * args.grad_accum))
+            training_steps = int(args.target_num_images / (ddp_world_size * args.batch_size * args.grad_accum))
 
         train_dataset = Dataset(args.path_train)
-        train_dl = get_data_loader(train_dataset, t.batch_size, ddp, pin_memory = "cuda" in device)
+        train_dl = get_data_loader(train_dataset, args.batch_size, ddp, pin_memory = "cuda" in device)
 
         if is_local_master:
             print(f"Training from latest checkpoint found in {args.model_dir}.\nTraining steps based on target_num_images and training_steps parameteres: {training_steps}")
 
-        t.train(training_steps, train_dl, is_master, is_local_master, device, args.save_every, args.sample_every, args.num_images_inference, args.num_rows_inference)
+        t.train(training_steps, args.batch_size, args.grad_accum, train_dl, is_master, is_local_master, device, args.save_every, args.sample_every, args.num_images_inference, args.num_rows_inference)
         
     else:
         mn = MappingNetwork(args.latent_dim, args.mn_depth, 
@@ -676,10 +655,9 @@ if __name__ == "__main__":
 
         train_dl = get_data_loader(train_dataset, args.batch_size, ddp, pin_memory = "cuda" in device)
         
-        t = Trainer(mn, g, d, args.model_dir, args.target_res, args.batch_size,
+        t = Trainer(mn, g, d, args.model_dir, args.target_res,
                     loss_type = args.loss_type, 
                     learning_rate = args.learning_rate, 
-                    grad_accum_steps = args.grad_accum, 
                     style_mixing_prob = args.style_mixing_prob, 
                     gen_ema_beta = args.gen_ema_beta, 
                     ema_steps_threshold = args.ema_steps_threshold,
@@ -700,7 +678,7 @@ if __name__ == "__main__":
         if is_master:
             print(f"Training freshly initialized model.\nTraining steps based on target_num_images and training_steps parameters: {training_steps}")
             
-        t.train(training_steps, train_dl, is_master, is_local_master, device, args.save_every, args.sample_every, args.num_images_inference, args.num_rows_inference)
+        t.train(training_steps, args.batch_size, args.grad_accum, train_dl, is_master, is_local_master, device, args.save_every, args.sample_every, args.num_images_inference, args.num_rows_inference)
 
     if ddp:
         destroy_process_group()
