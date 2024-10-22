@@ -20,7 +20,6 @@ def preprocess(img_size, source_dir : str, target_dir : str, allowed_labels : Li
     """
 
     x = int(math.log2(img_size))
-    assert math.log2(img_size) == x, f"{img_size} is not a power of 2"
 
     if not os.path.exists(target_dir):
         os.mkdir(target_dir)

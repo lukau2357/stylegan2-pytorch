@@ -443,8 +443,8 @@ class Trainer:
                 os.mkdir(self.root_path)
 
             # Seperate directory for storing samples obtained during training
-            if not os.path.exists(os.path.join(self.root_path, "samples")):
-                os.mkdir(os.path.join(self.root_path, "samples"))
+            if not os.path.exists(os.path.join(self.root_path, "training_samples")):
+                os.mkdir(os.path.join(self.root_path, "training_samples"))
 
             with open(os.path.join(self.root_path, ".metadata.json"), "w+", encoding = "utf-8") as f:
                 json.dump(self.global_metadata_dict(), f, indent = 4)
@@ -498,7 +498,7 @@ class Trainer:
                                                                 w_estimate_samples = self.w_estimate_samples,
                                                                 update_w_ema = False)
                                     
-                                Image.fromarray(ema_samples, mode = "RGB").save(os.path.join(self.root_path, "samples", f"ema_samples_{self.g_steps}_{i}{j}.jpg"))
+                                Image.fromarray(ema_samples, mode = "RGB").save(os.path.join(self.root_path, "training_samples", f"ema_samples_{self.g_steps}_{i}{j}.jpg"))
 
                             current_samples = generate_samples(self.G, self.MN, device, num_images_inference,
                                                             style_mixing_prob = smp,
@@ -507,7 +507,7 @@ class Trainer:
                                                             w_estimate_samples = self.w_estimate_samples,
                                                             update_w_ema = False)
                                 
-                            Image.fromarray(current_samples, mode = "RGB").save(os.path.join(self.root_path, "samples", f"current_samples_{self.g_steps}_{i}{j}.jpg"))
+                            Image.fromarray(current_samples, mode = "RGB").save(os.path.join(self.root_path, "training_samples", f"current_samples_{self.g_steps}_{i}{j}.jpg"))
 
             pbar.update(1)
         
@@ -518,7 +518,7 @@ def parse_args():
     parser = argparse.ArgumentParser(formatter_class = argparse.ArgumentDefaultsHelpFormatter)
     # Mandatory
     parser.add_argument("path_train", type = str, help = "Path to training set images")
-    parser.add_argument("target_res", type = int, default = 128, help = "Width and height of images, should be a power of 2 consistent with provided datasets, for now")
+    parser.add_argument("target_res", type = int, default = 128, help = "Width and height of images.")
     parser.add_argument("model_dir", type = str, help = "Directory where model checkpoints and infered samples should be saved")
 
     # Optional
@@ -540,7 +540,7 @@ def parse_args():
     parser.add_argument("--disc_use_mbstd", type = bool, default = True, help = "Use minibatch-std in last layer of discriminator")
     parser.add_argument("--style_mixing_probs_inference", type = float, nargs = "+", default = [0.0], help = "Different style mixing probabilities to try during inference, pass as a space-seperated list of floats")
     parser.add_argument("--truncation_psis_inference", type = float, nargs = "+", default = [1], help = "Different psi-s for truncation trick to use during inference, pass as a space-seperated list of floats")
-    parser.add_argument("--fir_filter_sampling", nargs = "+", default = [1, 3, 3, 1], help = "Unnormalized FIR filter to use in upsampling/downsampling layers")
+    parser.add_argument("--fir_filter_sampling", type = int, nargs = "+", default = [1, 3, 3, 1], help = "Unnormalized FIR filter to use in upsampling/downsampling layers")
     parser.add_argument("--w_ema_beta", type = float, default = 0.995, help = "EMA coefficient to use when estimating mean style vector in mapping network during training")
     parser.add_argument("--max_filters", type = int, default = 512, help = "Maximum number of filters to use in convolutional layers of generator and discriminator")
     parser.add_argument("--mbstd_group_size", type = int, default = 4, help = "Minibatch standard deviation group size for discriminator, --batch-size should be divisible by this")

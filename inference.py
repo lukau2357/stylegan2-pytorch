@@ -3,6 +3,7 @@ import torch
 import os
 import time
 import json
+import tqdm
 
 from datetime import datetime
 
@@ -53,7 +54,8 @@ def inference(model_dir : str, inference_dir : str, device : str, truncation_psi
     with open(os.path.join(inference_dir, timestamp, ".run_metadata.json"), "w+", encoding = "utf-8") as f:
         json.dump(metadata, f, indent = 4)
 
-    for i in range(inference_count):
+    print("Inference:")
+    for i in tqdm.tqdm(range(inference_count)):
         start = time.time()
         grid, truncation_base = generate_samples(generator, mapping_network, device, num_samples, 
                                 style_mixing_prob = 0, # No style mixing for inference
